@@ -2,32 +2,24 @@
 from .general_ui import *
 from . import facs
 from functools import partial
-
+from maya import cmds
 
 class TargetList(QListWidget):
 
     def __init__(self, parent=None):
         QListWidget.__init__(self, parent)
-        self.setSelectionMode(self.ExtendedSelection)
+        self.setSelectionMode(ExtendedSelection)
         self.menu = QMenu(self)
-        self.menu.addAction(u"修改", self.edit_target)
-        self.menu.addAction(u"添加", self.add_sdk)
-        self.menu.addAction(u"组合", self.add_comb)
-        self.menu.addAction(u"插入", self.add_ib)
+        self.menu.addAction(u"添加/修改", self.add_edit_target)
         self.menu.addAction(u"删除", self.delete_targets)
         self.menu.addAction(u"镜像", self.mirror_target)
-        self.menu.addAction(u"自定义镜像", self.custom_mirror)
-
-        self.menu.addAction(u"layer", self.edit_static_target)
-
-        warp_menu = self.menu.addMenu(u"包裹")
-        warp_menu.addAction(u"layer", partial(self.warp, True))
-        warp_menu.addAction(u"skin", partial(self.warp, False))
+        self.menu.addAction(u"传递", partial(self.warp, False))
         self.itemDoubleClicked.connect(self.set_pose)
         self.text = u""
 
     def set_pose(self):
-        facs.set_pose_by_targets(self.selected_targets())
+        facs.all_to_zero()
+        facs.to_targets(self.selected_targets())
 
     def selected_targets(self):
         return [item.text() for item in self.selectedItems()]
@@ -40,32 +32,10 @@ class TargetList(QListWidget):
         self.addItems(facs.get_targets())
         self.query()
 
-    def edit_target(self):
-        targets = self.selected_targets()
-        if len(targets) != 1:
-            return pm.warning("please selected only one target")
-        facs.edit_target(targets[0])
-
-    def edit_static_target(self):
-        targets = self.selected_targets()
-        if len(targets) != 1:
-            return pm.warning("please selected only one target")
-        facs.edit_static_target(targets[0])
-
-    def add_sdk(self):
-        facs.add_sdk_by_selected()
+    def add_edit_target(self):
+        facs.auto_add_edit_target(self.text.split(","))
         self.reload()
 
-    def add_comb(self):
-        facs.add_comb(self.selected_targets())
-        self.reload()
-
-    def add_ib(self):
-        targets = self.selected_targets()
-        if len(targets) != 1:
-            return pm.warning("please selected only one target")
-        facs.add_ib(targets[0])
-        self.reload()
 
     def delete_targets(self):
         facs.delete_targets(self.selected_targets())
@@ -73,10 +43,6 @@ class TargetList(QListWidget):
 
     def mirror_target(self):
         facs.mirror_targets(self.selected_targets())
-        self.reload()
-
-    def custom_mirror(self):
-        facs.custom_mirror(self.selected_targets())
         self.reload()
 
     def query(self):
@@ -92,12 +58,19 @@ class TargetList(QListWidget):
                 item = self.item(i)
                 self.setItemHidden(item, False)
 
+    def setItemHidden(self, item, hidden):
+        if not hasattr(QListWidget, "setItemHidden"):
+            item.setHidden(hidden)
+        else:
+            QListWidget.setItemHidden(self, item, hidden)
+
     def set_text(self, text):
         self.text = text
-        if self.text:
-            self.query()
-        else:
-            self.reload()
+        self.query()
+
+    def update_objs(self, text):
+        self.set_text(text)
+        self.reload()
 
     def warp(self, static):
         facs.warp_copy(self.selected_targets(), static)
@@ -117,17 +90,78 @@ class FaceTargetEditTool(Tool):
         self.kwargs_layout.addWidget(self.list)
         self.slider.slider.valueChanged.connect(self.set_ib_pose_by_targets)
         self.query.line.textChanged.connect(self.list.set_text)
-        # self.query.line.textChanged.connect(self.list.set_text)
+        self.query.objChanged.connect(self.list.update_objs)
+        self.slider.button.clicked.connect(self.esc)
 
     def set_ib_pose_by_targets(self, value):
-        facs.set_pose_by_targets(self.list.selected_targets(), value, False)
-        pm.refresh()
+        facs.to_targets(self.list.selected_targets(), value)
 
     def apply(self):
-        targets = self.list.selected_targets()
-        if len(targets) != 1:
-            return pm.warning("please selected only one target")
-        facs.face_sdk(targets[0])
+        text = self.query.line.text().strip()
+        jnts = text.split(",") if text else []
+
+        if not jnts:
+            selected = self.list.selected_targets()
+            if selected:
+                target_name = selected[0]
+                if facs.bs.is_on_duplicate_edit():
+                    facs.bs.finish_duplicate_edit(lambda x: facs.to_targets([x]))
+                else:
+                    def _add_target(_target_name):
+                        bridge = facs.get_bridge()
+                        facs.auto_add_target(facs.find_add_sdk_data(facs.get_real_ctrls([])), target_name, "base")
+                        return bridge + "." + _target_name
+                    def _set_target(_target_name):
+                        if not facs.target_is_base(_target_name):
+                            facs.to_targets([_target_name])
+                    facs.bs.auto_duplicate_edit([target_name], _add_target, _set_target)
+                self._update_button_state()
+                self.list.reload()
+                return
+
+        facs.auto_apply(jnts)
+        self._update_button_state()
+        self.list.reload()
+
+    def _update_button_state(self):
+        """★ 根据场景状态切换按钮外观"""
+        if facs.bs.is_on_duplicate_edit():
+            target_name = facs.bs.get_editing_target_name() or "?"
+            self.button.setText(u"结束修改: %s" % target_name)
+            self.button.setStyleSheet("background-color: #ff5555; color: white; font-weight: bold;")
+            self.button.setContextMenuPolicy(Qt.CustomContextMenu)
+            try:
+                self.button.customContextMenuRequested.disconnect(self._show_cancel_menu)
+            except (RuntimeError, TypeError):
+                pass
+            self.button.customContextMenuRequested.connect(self._show_cancel_menu)
+        else:
+            self.button.setText(u"面部驱动")
+            self.button.setStyleSheet("")
+            self.button.setContextMenuPolicy(Qt.DefaultContextMenu)
+            try:
+                self.button.customContextMenuRequested.disconnect(self._show_cancel_menu)
+            except (RuntimeError, TypeError):
+                pass
+
+    def _show_cancel_menu(self, pos):
+        target_name = facs.bs.get_editing_target_name() or "?"
+        menu = QMenu(self.button)
+        menu.addAction(u"放弃 %s 的修改" % target_name, self._cancel_edit)
+        menu.exec_(self.button.mapToGlobal(pos))
+
+    def _cancel_edit(self):
+        facs.bs.cancel_duplicate_edit()
+        self._update_button_state()
+        self.list.reload()
+
+    def showNormal(self):
+        QDialog.showNormal(self)
+        self._update_button_state()
+
+    @staticmethod
+    def esc():
+        facs.esc()
 
 
 
@@ -139,4 +173,5 @@ def show():
     if window is None:
         window = FaceTargetEditTool()
     window.show()
+    window._update_button_state()
     window.list.reload()

@@ -1,44 +1,34 @@
 [
     [
-        "\u5de6\u8fb9", 
-        "right", 
+        "\u5de6\u8fb9",
+        "right",
         [
-            "R_*", 
-            "*Rt*", 
-            "*_R", 
-            "*Right*"
+            "{name}_R",
+            "{pre}_R_{suf}"
         ]
-    ], 
+    ],
     [
-        "\u53f3\u8fb9", 
-        "left", 
+        "\u53f3\u8fb9",
+        "left",
         [
-            "L_*", 
-            "*Lf*", 
-            "*_L", 
-            "*Left*"
+            "{name}_L",
+            "{pre}_L_{suf}"
         ]
-    ], 
+    ],
     [
-        "\u9aa8\u9abc", 
-        "joint", 
+        "\u9aa8\u9abc",
+        "joint",
         [
-            "*", 
-            "*Joint", 
-            "*_jnt", 
-            "*JNT", 
-            "^(?P<name>\\w+)Part[0-9](?P<suffix>\\w+)$"
+            "{name}",
+            "{name}Part{i}_{RL}"
         ]
-    ], 
+    ],
     [
-        "\u63a7\u5236\u5668", 
-        "ctrl", 
+        "\u63a7\u5236\u5668",
+        "ctrl",
         [
-            "FK*", 
-            "*Control", 
-            "*_ctrl", 
-            "*CON", 
-            "FK{name}{suffix}"
+            "FK{name}",
+            "FK{name}_{RL}"
         ]
     ]
 ]

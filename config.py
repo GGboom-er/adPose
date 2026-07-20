@@ -8,10 +8,10 @@ from .general_ui import *
 
 config = None
 default_config = data = [
-    [u"左边", "right", ["R_*", "*Rt*", "*_R", "*Right*"]],
-    [u"右边", "left", ["L_*", "*Lf*", "*_L", "*Left*"]],
-    [u"骨骼", "joint", ["*", "*Joint", "*_jnt", "*JNT", r"^(?P<name>\w+)Part[0-9](?P<suffix>\w+)$"]],
-    [u"控制器", "ctrl", ["FK*", "*Control", "*_ctrl", "*CON", "FK{name}{suffix}"]],
+    [u"左边", "right", ["{name}_R", "{pre}_R_{suf}"]],
+    [u"右边", "left", ["{name}_L", "{pre}_L_{suf}"]],
+    [u"骨骼", "joint", ["{name}", "{name}Part{i}_{RL}"]],
+    [u"控制器", "ctrl", ["FK{name}", "FK{name}_{RL}"]],
 ]
 
 
@@ -57,24 +57,24 @@ class ConfigTool(Tool):
             self.weights[key].setText(",".join(value))
 
 
+
 def get_names(name, src_formats, dst_formats):
     names = []
     for src, dst in zip(src_formats, dst_formats):
-        if src == "*":
-            names.append(dst.replace("*", name))
-        elif src[0] == "*" and src[-1] == "*":
-            if src[1:-1] in name:
-                names.append(name.replace(src[1:-1], dst[1:-1]))
-        elif src[0] == "*":
-            if name[-len(src)+1:] == src[1:]:
-                names.append(name[:-len(src)+1] + dst[1:])
-        elif src[-1] == "*":
-            if name[:len(src)-1] == src[:-1]:
-                names.append(dst[:-1]+name[len(src)-1:])
-        elif "?" in src:
-            match = re.match(src, name)
-            if match:
-                names.append(dst.format(**match.groupdict()))
+        keys = re.findall(r"\{\w+\}", src)
+        if not keys:
+            continue
+        for key in keys:
+            src = src.replace(key, r"(\w+)")
+        match = re.match(src+"$", name)
+        if not match:
+            continue
+        keys = [key[1:-1] for key in keys]
+        values = match.groups()
+        if not len(values) == len(keys):
+            continue
+        new_name = dst.format(**dict(zip(keys, values)))
+        names.append(new_name)
     return names
 
 

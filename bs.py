@@ -1,564 +1,807 @@
 # coding:utf-8
-from maya.OpenMaya import *
-import pymel.core as pm
-import os
-from .api_lib import bs_api
+"""
+BlendShape 核心模块
+已从 pymel 迁移到 maya.cmds
+"""
+from maya.api.OpenMaya import *
 from maya import cmds
+from .bs_api import bs_api
 
-def load_ocd_plug():
-    version = int(round(float(pm.about(q=1, v=1))))
-    for name in ["ocd", "SSDR2"]:  # "ad_pose_bs"
-        path = os.path.abspath(__file__+"/../plug-ins/maya%04d/%s.mll" % (version, name))
-        if not os.path.isfile(path):
-            continue
-        if pm.pluginInfo(name, q=1, l=1):
-            continue
-        pm.loadPlugin(path)
+# ---------------bs fun--------------------
 
 
-def get_fn_mesh_by_name(name):
+# --------------- HUD 视口提示 ----------------
+_ADPOSE_HUD_NAME = 'adposeEditHUD'
+
+
+def show_edit_hud(target_name):
+    """在视口中显示当前正在编辑的 target 名称"""
+    remove_edit_hud()
+    free_block = cmds.headsUpDisplay(nextFreeBlock=5)
+    cmds.headsUpDisplay(
+        _ADPOSE_HUD_NAME, section=5, block=free_block,
+        blockSize='large', labelFontSize='large',
+        label='[ADPose] Editing: %s' % target_name)
+
+
+def remove_edit_hud():
+    """移除视口 HUD 提示"""
+    if cmds.headsUpDisplay(_ADPOSE_HUD_NAME, exists=True):
+        cmds.headsUpDisplay(_ADPOSE_HUD_NAME, remove=True)
+
+
+def check_leftover_edit():
+    """检测场景中是否有上次未完成的编辑残留组，返回残留的 target 名称或 None"""
+    if not cmds.objExists('lush_duplicate_edit'):
+        return None
+    return get_editing_target_name()
+
+def api_ls(*names):
     selection_list = MSelectionList()
-    selection_list.add(name)
-    dag_path = MDagPath()
-    selection_list.getDagPath(0, dag_path)
-    fn_mesh = MFnMesh(dag_path)
-    return fn_mesh
-
-
-def get_polygon_points_by_name(name, points):
-    fn_mesh = get_fn_mesh_by_name(name)
-    fn_mesh.getPoints(points)
-
-
-def set_polygon_points_by_name(name, points):
-    fn_mesh = get_fn_mesh_by_name(name)
-    fn_mesh.setPoints(points)
-
+    for name in names:
+        selection_list.add(name)
+    return selection_list
 
 def get_bs_ipt_ict(bs, index):
-    selection_list = MSelectionList()
-    selection_list.add(bs)
-    depend_node = MObject()
-    selection_list.getDependNode(0, depend_node)
-    fn_depend_node = MFnDependencyNode(depend_node)
-    iti = fn_depend_node.findPlug("it").elementByLogicalIndex(0).child(0).elementByLogicalIndex(index).child(0).\
-        elementByLogicalIndex(6000)
-    ipt = iti.child(3)
-    ict = iti.child(4)
-    return ipt, ict
+    ipt_name = "{bs}.it[0].itg[{index}].iti[6000].ipt".format(**locals())
+    ict_name = "{bs}.it[0].itg[{index}].iti[6000].ict".format(**locals())
+    ipt_plug = api_ls(ipt_name).getPlug(0)
+    ict_plug = api_ls(ict_name).getPlug(0)
+    return ipt_plug, ict_plug
+
+def set_ids_points(bs, index, ids, points):
+    ipt_name = "{bs}.it[0].itg[{index}].iti[6000].ipt".format(**locals())
+    ict_name = "{bs}.it[0].itg[{index}].iti[6000].ict".format(**locals())
+    ipt_plug, ict_plug = get_bs_ipt_ict(bs, index)
+    fn_component = MFnSingleIndexedComponent()
+    fn_component.create(MFn.kMeshVertComponent)
+    fn_component.addElements(ids)
+    fn_component_list = MFnComponentListData()
+    fn_component_list.create()
+    fn_component_list.add(fn_component.object())
+    ict_plug.setMObject(fn_component_list.object())
+    fn_points = MFnPointArrayData()
+    fn_points.create(MPointArray(points))
+    ipt_plug.setMObject(fn_points.object())
+
+def get_invert_blendshape_m33(bs, index, base, orig):
+    cmds.blendShape(bs, e=1, rtd=[0, index])
+    cmds.setAttr(bs+".envelope", 0)
+    orig_fn_mesh = MFnMesh(api_ls(orig).getDagPath(0))
+    temp_orig = cmds.group(em=1, n="temp_bs_orig"+orig.split("|")[-1])
+    cmds.parent(orig, temp_orig, s=1, add=1)
+    dup_temp_orig = cmds.duplicate(temp_orig, n="dup_"+temp_orig)[0]
+    cmds.delete(temp_orig)
+    for s in cmds.listRelatives(dup_temp_orig, f=1) or []:
+        cmds.setAttr(s+".intermediateObject", 0)
+    offset_fn_mesh = MFnMesh(api_ls(dup_temp_orig).getDagPath(0))
+    point_data = [cmds.xform(base+".vtx[*]", q=1, ws=1, t=1)]
+    for xyz in "xyz":
+        cmds.setAttr(dup_temp_orig+".t"+xyz, 1)
+        orig_fn_mesh.setPoints(offset_fn_mesh.getPoints(MSpace.kWorld))
+        point_data.append(cmds.xform(base+".vtx[*]", q=1, ws=1, t=1))
+        cmds.setAttr(dup_temp_orig+".t"+xyz, 0)
+    orig_fn_mesh.setPoints(offset_fn_mesh.getPoints(MSpace.kWorld))
+    cmds.delete(dup_temp_orig)
+    m33 = bs_api.invert_blendshape_m33(*point_data)
+    cmds.setAttr(bs+".envelope", 1)
+    return m33
+
+def get_attr_logical_index(bs, name):
+    """获取属性的逻辑索引"""
+    attr = "{bs}.{name}".format(**locals())
+    if not cmds.objExists(attr):
+        return None
+    plug = api_ls(attr).getPlug(0)
+    return plug.logicalIndex()
+
+M33, BASE = None, None
+
+def cache_target(bs, index, polygon_name, orig_name):
+    """缓存某个 target 的必要信息，用于实时更新/回写。"""
+    global M33, BASE
+    M33 = get_invert_blendshape_m33(bs, index, polygon_name, orig_name)
+    BASE = bs_api.c_double_array(cmds.xform(polygon_name+".vtx[*]", q=1, ws=1, t=1))
 
 
-def matrix_set_data(matrix, data):
-    for i in range(4):
-        for j in range(4):
-            MScriptUtil.setDoubleArray(matrix[i], j, data[i][j])
-
-
-def get_bs_ids_points(polygon, name):
-    ids = MIntArray()
-    points = MPointArray()
-    bs = get_bs(polygon)
-    if not bs.hasAttr(name):
-        return ids, points
-    index = bs.attr(name).logicalIndex()
-    ipt, ict = get_bs_ipt_ict(bs.name(), index)
-    fn_component_list = MFnComponentListData(ict.asMObject())
-    for i in range(fn_component_list.length()):
-        fn_component = MFnSingleIndexedComponent(fn_component_list[i])
-        _ids = MIntArray()
-        fn_component.getElements(_ids)
-        for j in range(_ids.length()):
-            ids.append(_ids[j])
-    fn_points = MFnPointArrayData(ipt.asMObject())
-    fn_points.copyTo(points)
-    return ids, points
+def set_target(bs, index, target_name):
+    """把 target_name 对应的 mesh 更新到 bs 的 index target 上。"""
+    points = bs_api.invert_points(BASE, cmds.xform(target_name+".vtx[*]", q=1, ws=1, t=1), M33)
+    ids, points = bs_api.zip_points(points)
+    set_ids_points(bs, index, ids, points)
 
 
 def set_bs_ids_points(polygon, name, ids, points):
+    """设置 blendShape 目标的顶点 ID 和位置"""
     bs = get_bs(polygon)
-    add_target(polygon, name)
-    index = bs.attr(name).logicalIndex()
-    ipt, ict = get_bs_ipt_ict(bs.name(), index)
-    fn_component = MFnSingleIndexedComponent()
-    fn_component_obj = fn_component.create(MFn.kMeshVertComponent)
-    fn_component.addElements(ids)
-    fn_component_list = MFnComponentListData()
-    fn_component_list_obj = fn_component_list.create()
-    fn_component_list.add(fn_component_obj)
-    fn_points = MFnPointArrayData()
-    fn_points_obj = fn_points.create(points)
-    ict.setMObject(fn_component_list_obj)
-    ipt.setMObject(fn_points_obj)
+    index = get_attr_logical_index(bs, name)
+    if index is None:
+        return
+    set_ids_points(bs, index, ids, points)
 
 
-def is_polygon(polygon):
-    if polygon.type() != "transform":
-        return False
-    shape = polygon.getShape()
-    if not shape:
-        return False
-    if shape.type() != "mesh":
-        return False
-    return True
-
-
-def get_child_polygons(group):
-    polygons = group.listRelatives(ad=1, type="transform")
-    polygons.insert(0, group)
-    return [poly for poly in polygons if is_polygon(poly)]
-
-
-def get_name_polygon_by_hierarchy(group):
-    data = {}
-    polygons = group.listRelatives(ad=1, type="transform")
-    polygons.insert(0, group)
-    length = len(group.fullPath()) + 1
-    for polygon in polygons:
-        name = "|" + polygon.fullPath()[length:]
-        if not is_polygon(polygon):
-            continue
-        data[name] = polygon
-    return data
-
-
-def get_polygon_matrix_by_root(*roots):
-    return get_polygon_matrix_by_map([get_name_polygon_by_hierarchy(root) for root in roots])
-
-
-def get_name_polygon_by_short_name(polygons):
-    return {polygon.name().split("|")[-1]:polygon for polygon in polygons}
-
-
-def get_polygon_matrix_by_polygons(*polygons):
-    return get_polygon_matrix_by_map([get_name_polygon_by_short_name(poly) for poly in polygons])
-
-
-def get_polygon_matrix_by_map(name_polygons):
-    polygon_matrix = []
-    for name in name_polygons[0].keys():
-        polygons = [name_polygon.get(name, None) for name_polygon in name_polygons]
-        if None in polygons:
-            continue
-        polygon_matrix.append(polygons)
-    return polygon_matrix
+def api_edit_target(bs, index, target, base, orig):
+    m33 = get_invert_blendshape_m33(bs, index, base, orig)
+    target_points = cmds.xform(target + ".vtx[*]", q=1, ws=1, t=1)
+    base_points = cmds.xform(base + ".vtx[*]", q=1, ws=1, t=1)
+    points = bs_api.invert_points(base_points, target_points, m33)
+    ids, points = bs_api.zip_points(points)
+    if len(ids) == 0:
+        delete_target_by_index(bs, index)
+    else:
+        set_ids_points(bs, index, ids, points)
 
 
 def get_bs(polygon):
-    bs = polygon.listHistory(type="blendShape")
-    if bs:
-        bs = bs[0]
+    """获取或创建 blendShape 节点"""
+    bs_list = [n for n in cmds.listHistory(polygon) or [] if cmds.nodeType(n) == "blendShape"]
+    if bs_list:
+        bs = bs_list[0]
     else:
+        short_name = polygon.split("|")[-1]
+        # Maya < 2016 不支持 automatic 参数，回退到手动方式
         try:
-            bs = pm.blendShape(polygon, automatic=True, n=polygon.name().split("|")[-1] + "_bs")[0]
+            bs = cmds.blendShape(polygon, automatic=True, n=short_name + "_bs")[0]
         except TypeError:
-            dup = polygon.duplicate()[0]
-            bs = pm.blendShape(dup, polygon, frontOfChain=1, n=polygon.name().split("|")[-1] + "_bs")[0]
-            pm.delete(dup)
-            delete_target(bs.weight[0])
+            dup = cmds.duplicate(polygon)[0]
+            bs = cmds.blendShape(dup, polygon, frontOfChain=True, n=short_name + "_bs")[0]
+            cmds.delete(dup)
+            # 删除第一个目标
+            cmds.aliasAttr(bs + ".weight[0]", rm=True)
+            cmds.removeMultiInstance(bs + ".weight[0]", b=True)
+            cmds.removeMultiInstance(bs + ".it[0].itg[0]", b=True)
     return bs
 
-
 def find_bs(polygon):
-    bs = polygon.listHistory(type="blendShape")
-    if bs:
-        return bs[0]
-
-
-def add_target(polygon, name):
-    bs = get_bs(polygon)
-    if bs.hasAttr(name):
-        return
-    ids = [bs.weight.elementByPhysicalIndex(i).logicalIndex() for i in range(bs.weight.numElements())]
-    index = -1
-    while True:
-        index += 1
-        if index not in ids:
-            break
-    bs.weight[index].set(1)
-    pm.aliasAttr(name, bs.weight[index])
-    bs_api.init_target(bs.name(), index)
-
-
-def delete_target(weight_attr):
-    index = weight_attr.logicalIndex()
-    bs = weight_attr.node()
-    pm.aliasAttr(weight_attr, rm=1)
-    pm.removeMultiInstance(weight_attr, b=1)
-    pm.removeMultiInstance(bs.it[0].itg[index], b=1)
-
+    """查找 blendShape 节点"""
+    for node in cmds.listHistory(polygon) or []:
+        if cmds.nodeType(node) == "blendShape":
+            return node
+    return None
 
 def get_orig(polygon):
-    # for shape in polygon.getShapes():
-    #     if shape.io.get():
-    #         if not shape.outputs(type="groupParts"):
-    #             pm.delete(shape)
-    # for shape in polygon.getShapes():
-    #     if shape.io.get():
-    #         if shape.outputs(type="groupParts"):
-    #             return shape
-    orig_list = [shape for shape in polygon.getShapes() if shape.io.get()]
-    orig_list.sort(key=lambda x: len(set(x.outputs())))
+    """获取原始形状节点"""
+    shapes = cmds.listRelatives(polygon, s=True, f=True) or []
+    orig_list = []
+    for shape in shapes:
+        if cmds.getAttr(shape + ".intermediateObject"):
+            orig_list.append(shape)
+    # 按输出连接数排序
+    orig_list.sort(key=lambda x: len(set(cmds.listConnections(x, s=False, d=True) or [])))
     if orig_list:
         return orig_list[-1]
-
+    return None
 
 def edit_target(target, base, name):
+    """编辑 blendShape 目标"""
     bs = get_bs(base)
-    if not bs.hasAttr(name):
+    if not cmds.attributeQuery(name, node=bs, exists=True):
         return
-    index = bs.attr(name).logicalIndex()
+    index = get_attr_logical_index(bs, name)
+    if index is None:
+        return
     orig = get_orig(base)
-    bs_api.edit_target(bs.name(), index, target.name(), base.name(), orig.name())
+    api_edit_target(bs, index, target, base, orig)
+
+
+def get_next_index(bs):
+    elem_indexes = cmds.getAttr(bs+".weight", mi=1) or []
+    index = len(elem_indexes)
+    for i in range(index):
+        if i == elem_indexes[i]:
+            continue
+        index = i
+        break
+    return index
+
+def add_bs_target(bs, name):
+    if cmds.objExists(bs + "." + name):
+        return
+    index = get_next_index(bs)
+    bs_attr = bs+'.weight[%i]' % index
+    cmds.setAttr(bs+'.weight[%i]' % index, 1)
+    cmds.aliasAttr(name, bs_attr)
+    ipt_name = "{bs}.it[0].itg[{index}].iti[6000].ipt".format(**locals())
+    ict_name = "{bs}.it[0].itg[{index}].iti[6000].ict".format(**locals())
+    cmds.getAttr(ipt_name, type=1)
+    cmds.getAttr(ict_name, type=1)
+
+def add_target(polygon, name):
+    """添加 blendShape 目标"""
+    bs = get_bs(polygon)
+    add_bs_target(bs, name)
+
+
+
+def get_ids_points(bs, index):
+    ipt = "{bs}.it[0].itg[{index}].iti[6000].ipt".format(**locals())
+    ict = "{bs}.it[0].itg[{index}].iti[6000].ict".format(**locals())
+    if not cmds.objExists(ipt) or not cmds.objExists(ict):
+        return [], []
+    try:
+        obj = api_ls(ict).getPlug(0).asMObject()
+    except RuntimeError as e:
+        cmds.warning('get_ids_points: failed to read component data for %s[%s]: %s' % (bs, index, e))
+        return [], []
+    ids = []
+    fn_component_list = MFnComponentListData(obj)
+    for i in range(fn_component_list.length()):
+        fn_component = MFnSingleIndexedComponent(fn_component_list.get(i))
+        ids.extend(fn_component.getElements())
+    points = cmds.getAttr(ipt)
+    return ids, points
 
 
 def bridge_connect(attr, dst):
-    name = attr.name(includeNode=False)
+    """桥接连接属性到目标"""
+    # attr 格式: "node.attrName"
+    parts = attr.split(".")
+    name = parts[-1] if len(parts) > 1 else attr
     add_target(dst, name)
     bs = get_bs(dst)
-    if bs.attr(name) not in attr.outputs(p=1):
-        attr.connect(bs.attr(name), f=1)
+    # 检查是否已连接
+    dst_attr = "{}.{}".format(bs, name)
+    connections = cmds.listConnections(dst_attr, s=True, d=False, p=True) or []
+    if attr not in connections:
+        cmds.connectAttr(attr, dst_attr, f=True)
 
 
 def bridge_connect_edit(attr, src, dst):
+    """桥接连接并编辑目标"""
     bridge_connect(attr, dst)
-    edit_target(src, dst, attr.name(includeNode=False))
+    parts = attr.split(".")
+    name = parts[-1] if len(parts) > 1 else attr
+    edit_target(src, dst, name)
 
 
-def edit_static_target(target, base, name):
-    bs = get_bs(base)
-    if not bs.hasAttr(name):
+def delete_target_by_index(bs, index):
+    weight_attr = "{}.weight[{}]".format(bs, index)
+    cmds.aliasAttr(weight_attr, rm=True)
+    cmds.removeMultiInstance(weight_attr, b=True)
+    cmds.removeMultiInstance("{}.it[0].itg[{}]".format(bs, index), b=True)
+
+
+def delete_target(bs_or_attr, target_name=None):
+    """删除 blendShape 目标
+    支持两种调用方式：
+    - 新方式: delete_target(bs, target_name)
+    - 旧方式: delete_target(weight_attr)  # 兼容 PyNode 属性
+    """
+    if target_name is None:
+        # 旧方式调用，bs_or_attr 是 PyNode 属性或字符串属性
+        if hasattr(bs_or_attr, 'node'):
+            # PyNode 属性
+            bs = bs_or_attr.node().name()
+            target_name = bs_or_attr.name(includeNode=False)
+        else:
+            # 字符串属性 "bs.targetName"
+            parts = str(bs_or_attr).split(".")
+            bs = parts[0]
+            target_name = parts[-1]
+    else:
+        bs = bs_or_attr
+
+    index = get_attr_logical_index(bs, target_name)
+    if index is None:
         return
-    index = bs.attr(name).logicalIndex()
-    orig = base.getShape()
-    bs_api.edit_static_target(bs.name(), index, target.name(), base.name())
-
-
-def bridge_static_connect_edit(attr, src, dst):
-    bridge_connect(attr, dst)
-    edit_static_target(src, dst, attr.name(includeNode=False))
-
-
-def check_null_by_id(bs, index):
-    ict = "{bs}.it[0].itg[{index}].iti[6000].ict".format(**locals())
-    return bool(cmds.getAttr(ict))
-    # if cmds.getAttr(ict):
-    #     return
-    # cmds.sculptTarget(bs, e=1, regenerate=1, target=index)
-    # igt = "{bs}.it[0].itg[{index}].iti[6000].igt".format(**locals())
-    # target_polygon_name = cmds.listConnections(igt, s=1, d=1)[0]
-    # cmds.delete(target_polygon_name)
-
-
-def _mirror_targets(bs, src_indexes, dst_indexes):
-    for src_id, dst_id in zip(src_indexes, dst_indexes):
-        if not check_null_by_id(bs, src_id):
-            continue
-        pm.blendShape(bs, e=1, rtd=[0, dst_id])
-        pm.blendShape(bs, e=1, cd=[0, src_id, dst_id])
-        pm.blendShape(bs, e=1, ft=[0, dst_id], sa="X", ss=1)
-
+    delete_target_by_index(bs, index)
 
 def mirror_targets(polygon, names):
+    """镜像多个目标"""
     bs = get_bs(polygon)
     src_indexes = []
     dst_indexes = []
     for src, dst in names:
-        if not bs.hasAttr(src):
+        if not cmds.attributeQuery(src, node=bs, exists=True):
+            cmds.warning("mirror_targets: source '{}' not found on BS node '{}'".format(src, bs))
             continue
-        if not bs.hasAttr(dst):
+        if not cmds.attributeQuery(dst, node=bs, exists=True):
+            cmds.warning("mirror_targets: destination '{}' not found on BS node '{}'".format(dst, bs))
             continue
-        src_indexes.append(bs.attr(src).logicalIndex())
-        dst_indexes.append(bs.attr(dst).logicalIndex())
-    orig = get_orig(polygon)
-    try:
-        _mirror_targets(bs.name(), src_indexes, dst_indexes)
-    except KeyError:
-        bs_api.mirror_targets(bs.name(), orig.name(), src_indexes, dst_indexes)
+        src_indexes.append(get_attr_logical_index(bs, src))
+        dst_indexes.append(get_attr_logical_index(bs, dst))
+    symmetric_cache = {key: cmds.symmetricModelling(q=1, **{key: True}) for key in ["s", "t", "ax", "a"]}
+    for src_id, dst_id in zip(src_indexes, dst_indexes):
+        if src_id != dst_id:
+            cmds.blendShape(bs, e=1, rtd=[0, dst_id])
+            cmds.blendShape(bs, e=1, cd=[0, src_id, dst_id])
+            cmds.blendShape(bs, e=1, ft=[0, dst_id], sa="X", ss=1)
+        else:
+            cmds.blendShape(bs, e=1, md=0, mt=[0, dst_id], sa="X", ss=1)
+    for k, value in symmetric_cache.items():
+        cmds.symmetricModelling(**{k: value})
 
 
-def get_blend_shape_data(polygon, target_names):
-    data = []
-    bs = get_bs(polygon)
-    for target_name in target_names:
-        if not bs.hasAttr(target_name):
-            continue
-        api_ids, api_points = get_bs_ids_points(polygon, target_name)
-        ids = [int(api_ids[i]) for i in range(api_ids.length())]
-        points = [[float(getattr(api_points[i], xyz)) for xyz in "xyz"] for i in range(api_points.length())]
-        data.append(dict(
-            target_name=target_name,
-            ids=ids,
-            points=points,
-        ))
-    return data
-
-
-def get_blend_shape_data_use_scale(polygon, target_names):
-    data = []
-    bs = get_bs(polygon)
-    scale = polygon.s.get()
-    for target_name in target_names:
-        if not bs.hasAttr(target_name):
-            continue
-        api_ids, api_points = get_bs_ids_points(polygon, target_name)
-        ids = [int(api_ids[i]) for i in range(api_ids.length())]
-        points = [[float(getattr(api_points[i], xyz)*getattr(scale, xyz)) for xyz in "xyz"]
-                  for i in range(api_points.length())]
-        data.append(dict(
-            target_name=target_name,
-            ids=ids,
-            points=points,
-        ))
-    return data
-
-
-def set_blend_shape_by_py_data(polygon, target_name, ids, points):
-    bs = get_bs(polygon)
-    if not bs.hasAttr(target_name):
-        return
-    api_ids = MIntArray()
-    for i in ids:
-        api_ids.append(i)
-    api_points = MPointArray()
-    for p in points:
-        api_point = MPoint(*p)
-        api_points.append(api_point)
-    set_bs_ids_points(polygon, target_name, api_ids, api_points)
-
-
-def set_blend_shape_data(polygon, data):
-    for row in data:
-        set_blend_shape_by_py_data(polygon, **row)
-
-
-def delete_selected_targets(target_names):
-    for polygon in pm.selected(type="transform"):
-        if not is_polygon(polygon):
-            continue
+def init_sel_polygons_targets(target_names):
+    """初始化目标"""
+    polygon_list = (cmds.ls("*Driver", type="transform", o=True) or []) + (cmds.ls(sl=True, type="transform", o=True) or [])
+    polygon_list = list(filter(is_polygon, polygon_list))
+    for polygon in polygon_list:
         bs = get_bs(polygon)
         for target_name in target_names:
-            if bs.hasAttr(target_name):
-                delete_target(bs.attr(target_name))
+            if not cmds.attributeQuery(target_name, node=bs, exists=True):
+                return
+            index = get_attr_logical_index(bs, target_name)
+            if index is not None:
+                cmds.blendShape(bs, e=1, rtd=[0, index])
+
+
+def get_selected_polygon_ids():
+    sel = MGlobal.getActiveSelectionList()
+    if not sel.length():
+        return None, None
+    dag_path, component = sel.getComponent(0)
+    if component.apiTypeStr != "kMeshVertComponent":
+        return None, None
+    ids = MFnSingleIndexedComponent(component).getElements()
+    polygon = cmds.listRelatives(dag_path.partialPathName(), p=1)[0]
+    return polygon, ids
+
+
+def init_sel_vtx_targets(polygon, remove_ids, target_names):
+    bs = get_bs(polygon)
+    point_count = cmds.polyEvaluate(polygon, vertex=1)
+    for target_name in target_names:
+        bs_attr = bs + "." + target_name
+        if not cmds.objExists(bs_attr):
+            continue
+        index = get_attr_logical_index(bs, target_name)
+        ids, points = get_ids_points(bs, index)
+        full_points = bs_api.unzip_points(ids, points, point_count)
+        remove_ids = list(remove_ids)
+        bs_api.remove_points(full_points, remove_ids)
+        ids, points = bs_api.zip_points(full_points)
+        set_ids_points(bs, index, ids, points)
+
+
+def init_targets(target_names):
+    polygon, ids = get_selected_polygon_ids()
+    if ids is None:
+        init_sel_polygons_targets(target_names)
+    else:
+        init_sel_vtx_targets(polygon, ids, target_names)
+
+
+def get_bs_target_names(bs):
+    """获取 blendShape 的所有目标名称"""
+    # aliases = cmds.aliasAttr(bs, q=True) or []
+    # return [aliases[i] for i in range(0, len(aliases), 2)]
+    return cmds.listAttr(bs+".weight", m=1)
+
+
+def is_on_duplicate_edit():
+    return cmds.objExists("lush_duplicate_edit")
 
 
 class LEditTargetJob(object):
 
-    def __init__(self, src, dst, name):
+    def __init__(self, src, dst, target):
         self.del_job()
-        bs = get_bs(dst)
-        self.index = bs.attr(name).logicalIndex()
-        self.bs_name = bs.name()
-        self.target_name = src.name()
-        polygon_name = dst.name()
-        orig_name = get_orig(dst).name()
-        bs_api.cache_target(self.bs_name, self.index, polygon_name, orig_name)
-        attr_name = src.getShape().outMesh.name()
-        pm.scriptJob(attributeChange=[attr_name, self])
+        self.bs = get_bs(dst)
+        self.index = get_attr_logical_index(self.bs, target)
+        self.src = src
+        cache_target(self.bs, self.index, dst, get_orig(dst))
+        cmds.scriptJob(attributeChange=[cmds.listRelatives(src, s=1)[0] + ".outMesh", self])
 
     def __repr__(self):
         return self.__class__.__name__
 
     def __call__(self):
-        bs_api.set_target(self.bs_name, self.index, self.target_name)
+        set_target(self.bs, self.index, self.src)
 
     def add_job(self):
         self.del_job()
 
     @classmethod
     def del_job(cls):
-        for job in pm.scriptJob(listJobs=True):
+        for job in cmds.scriptJob(listJobs=True):
             if repr(cls.__name__) in job:
-                pm.scriptJob(kill=int(job.split(":")[0]))
+                cmds.scriptJob(kill=int(job.split(":")[0]))
 
-
-def get_bs_igt_ict(bs, index):
-    selection_list = MSelectionList()
-    selection_list.add(bs)
-    depend_node = MObject()
-    selection_list.getDependNode(0, depend_node)
-    fn_depend_node = MFnDependencyNode(depend_node)
-    iti = fn_depend_node.findPlug("it").elementByLogicalIndex(0).child(0).elementByLogicalIndex(index).child(0).\
-        elementByLogicalIndex(6000)
-    igt = iti.child(0)
-    ict = iti.child(4)
-    return igt, ict
-
-
-def is_target_null(bs, name):
-    index = bs.attr(name).logicalIndex()
-    igt, ict = get_bs_igt_ict(bs.name(), index)
-    if bs.attr(igt.name()[len(bs.name())+1:]).inputs():
+def is_polygon(polygon):
+    """判断节点是否为多边形"""
+    if not cmds.objExists(polygon):
         return False
-    try:
-        fn_component_list = MFnComponentListData(ict.asMObject())
-    except:
-        return True
-    for i in range(fn_component_list.length()):
-        fn_component = MFnSingleIndexedComponent(fn_component_list[i])
-        _ids = MIntArray()
-        fn_component.getElements(_ids)
-        for j in range(_ids.length()):
-            return False
+    if cmds.nodeType(polygon) != "transform":
+        return False
+    shapes = cmds.listRelatives(polygon, s=True, ni=True)
+    if not shapes:
+        return False
+    if cmds.nodeType(shapes[0]) != "mesh":
+        return False
     return True
 
 
-def clear_un_use_bs():
-    clear_list = []
-    for bs in pm.ls(type="blendShape"):
-        if bs.isReferenced():
+def finish_duplicate_edit(set_pose_by_target):
+    LEditTargetJob.del_job()
+    root = "|lush_duplicate_edit"
+    if not cmds.objExists(root):
+        return
+    try:
+        for target_group in cmds.listRelatives(root) or []:
+            if target_group[:5] != "edit_":
+                continue
+            target = target_group[5:]
+            set_pose_by_target(target)
+            for src in cmds.listRelatives(target_group) or []:
+                if not is_polygon(src):
+                    continue
+                if not cmds.objExists(src+".edit_polygon_message"):
+                    continue
+                dst = cmds.listConnections(src+".edit_polygon_message", s=True, d=0, p=0)
+                if not dst:
+                    continue
+                dst = dst[0]
+                if not is_polygon(dst):
+                    continue
+                uu = cmds.ls(cmds.listConnections(dst+".v", s=1, d=0), type=["animCurveUU", "blendWeighted"])
+                if uu:
+                    cmds.delete(uu)
+                restore_visibility(dst, src)
+                edit_target(src, dst, target)
+    finally:
+        remove_edit_hud()
+        if cmds.objExists(root):
+            cmds.delete(root)
+
+
+def cancel_duplicate_edit():
+    """放弃当前编辑，不写入任何修改，恢复可见性、清理新建的 BS target 和临时组"""
+    LEditTargetJob.del_job()
+    root = "|lush_duplicate_edit"
+    if not cmds.objExists(root):
+        return
+    # ★ 读取新创建的 target 列表（cancel 时需要清理）
+    new_targets = []
+    if cmds.attributeQuery("adpose_new_targets", node=root, exists=True):
+        val = cmds.getAttr(root + ".adpose_new_targets") or ""
+        new_targets = [t for t in val.split(",") if t]
+    try:
+        for target_group in cmds.listRelatives(root) or []:
+            if target_group[:5] != "edit_":
+                continue
+            target = target_group[5:]
+            for src in cmds.listRelatives(target_group) or []:
+                if not is_polygon(src):
+                    continue
+                if not cmds.objExists(src + ".edit_polygon_message"):
+                    continue
+                dst = cmds.listConnections(src + ".edit_polygon_message", s=True, d=0, p=0)
+                if not dst:
+                    continue
+                dst = dst[0]
+                if not is_polygon(dst):
+                    continue
+                # 恢复原始网格可见性（清理 SDK 曲线，并恢复原有的连接或锁定状态）
+                uu = cmds.ls(cmds.listConnections(dst + ".v", s=1, d=0), type=["animCurveUU", "blendWeighted"])
+                if uu:
+                    cmds.delete(uu)
+                restore_visibility(dst, src)
+                # ★ 清理新创建的 blendShape target（不清理已有的）
+                if target in new_targets:
+                    bs_node = find_bs(dst)
+                    if bs_node and cmds.attributeQuery(target, node=bs_node, exists=True):
+                        idx = get_attr_logical_index(bs_node, target)
+                        if idx is not None:
+                            # 断开连接再删除
+                            attr = bs_node + "." + target
+                            for conn in cmds.listConnections(attr, s=True, d=False, p=True) or []:
+                                if cmds.isConnected(conn, attr):
+                                    cmds.disconnectAttr(conn, attr)
+                            delete_target_by_index(bs_node, idx)
+    finally:
+        remove_edit_hud()
+        if cmds.objExists(root):
+            cmds.delete(root)
+
+
+def get_editing_target_name():
+    """返回当前正在编辑的 target 名称，未在编辑中则返回 None"""
+    root = "|lush_duplicate_edit"
+    if not cmds.objExists(root):
+        return None
+    if cmds.attributeQuery("adpose_editing_target", node=root, exists=True):
+        return cmds.getAttr(root + ".adpose_editing_target")
+    # 回退：从子组名称解析
+    for child in cmds.listRelatives(root) or []:
+        if child[:5] == "edit_":
+            return child[5:]
+    return None
+
+
+def get_selected_polygons():
+    return list(filter(is_polygon, cmds.ls(sl=1, o=1)))
+
+
+def get_target_current_weight(target_name):
+    """查询指定 target 在所有 blendShape 节点上的当前权重值（0.0~1.0）"""
+    for bs_node in cmds.ls(type="blendShape") or []:
+        attr = bs_node + "." + target_name
+        if cmds.objExists(attr):
+            return cmds.getAttr(attr)
+    return 0.0
+
+
+def get_all_target_weights(target_names):
+    """批量查询多个 target 的当前权重，返回 {target_name: weight} 字典（性能优化版）"""
+    weights = {name: 0.0 for name in target_names}
+    bs_nodes = cmds.ls(type="blendShape") or []
+    if not bs_nodes or not target_names:
+        return weights
+
+    target_set = set(target_names)
+    for bs_node in bs_nodes:
+        # aliasAttr 返回 [alias, real_attr, alias, real_attr...]，极快
+        aliases = cmds.aliasAttr(bs_node, q=True) or []
+        for i in range(0, len(aliases), 2):
+            alias = aliases[i]
+            if alias in target_set:
+                weights[alias] = cmds.getAttr(bs_node + "." + alias)
+                target_set.remove(alias)
+        if not target_set:
+            break
+    return weights
+
+def duplicate_polygon_by_target(target, polygon):
+    root = "lush_duplicate_edit"
+    parent = "edit_"+target
+    name = target + "_" + polygon.split("|")[-1].split(":")[-1]
+    if not cmds.objExists(root):
+        cmds.group(em=1, n=root)
+    # ★ 在根节点上存储当前编辑的 target 名称（用于 UI 显示和状态查询）
+    if not cmds.attributeQuery("adpose_editing_target", node=root, exists=True):
+        cmds.addAttr(root, ln="adpose_editing_target", dt="string")
+    cmds.setAttr(root + ".adpose_editing_target", target, type="string")
+    show_edit_hud(target)
+    if not cmds.objExists("|lush_duplicate_edit|"+parent):
+        cmds.group(em=1, n=parent, p=root)
+    if cmds.objExists(name):
+        return name
+    dup = cmds.duplicate(polygon, n=name)[0]
+    # ★ WYSIWYG：删除复制体上的所有历史，让它变成静态雕塑
+    cmds.delete(dup, ch=True)
+    for shape in cmds.listRelatives(dup, s=1, f=1) or []:
+        if cmds.getAttr(shape + '.io'):
+            cmds.delete(shape)
+    cmds.parent(dup, parent)
+    for shape in cmds.listRelatives(dup, s=1, f=1) or []:
+        cmds.setAttr(shape + '.overrideEnabled', True)
+        cmds.setAttr(shape + '.overrideColor', 13)
+    if not cmds.objExists(dup+".edit_polygon_message"):
+        cmds.addAttr(dup, ln="edit_polygon_message", at="message")
+    cmds.connectAttr(polygon+".v", dup+".edit_polygon_message")
+    return dup
+
+
+def connect_polygons(attrs, polygons):
+    for attr in attrs:
+        for polygon in polygons:
+            bridge_connect(attr, polygon)
+
+def store_and_unlock_visibility(src_mesh, dup_mesh):
+    """保存并解锁原始网格的可见性，防止打断绑定的控制连接 (存在源 mesh 上保证稳定性)"""
+    if not cmds.attributeQuery("adpose_orig_vis_lock", node=src_mesh, exists=True):
+        cmds.addAttr(src_mesh, ln="adpose_orig_vis_lock", at="bool")
+    cmds.setAttr(src_mesh + ".adpose_orig_vis_lock", cmds.getAttr(src_mesh + ".v", lock=True))
+
+    conn = cmds.listConnections(src_mesh + ".v", s=True, d=False, p=True)
+    if conn:
+        if not cmds.attributeQuery("adpose_orig_vis_conn", node=src_mesh, exists=True):
+            cmds.addAttr(src_mesh, ln="adpose_orig_vis_conn", dt="string")
+        cmds.setAttr(src_mesh + ".adpose_orig_vis_conn", conn[0], type="string")
+        cmds.disconnectAttr(conn[0], src_mesh + ".v")
+    else:
+        if not cmds.attributeQuery("adpose_orig_vis_val", node=src_mesh, exists=True):
+            cmds.addAttr(src_mesh, ln="adpose_orig_vis_val", at="bool")
+        cmds.setAttr(src_mesh + ".adpose_orig_vis_val", cmds.getAttr(src_mesh + ".v"))
+
+    cmds.setAttr(src_mesh + ".v", lock=False)
+
+def restore_visibility(src_mesh, dup_mesh):
+    """恢复原始网格的可见性状态并清理暂存属性"""
+    if cmds.attributeQuery("adpose_orig_vis_conn", node=src_mesh, exists=True):
+        conn = cmds.getAttr(src_mesh + ".adpose_orig_vis_conn")
+        if cmds.objExists(conn):
+            cmds.connectAttr(conn, src_mesh + ".v", f=True)
+        cmds.deleteAttr(src_mesh, at="adpose_orig_vis_conn")
+    elif cmds.attributeQuery("adpose_orig_vis_val", node=src_mesh, exists=True):
+        cmds.setAttr(src_mesh + ".v", cmds.getAttr(src_mesh + ".adpose_orig_vis_val"))
+        cmds.deleteAttr(src_mesh, at="adpose_orig_vis_val")
+    else:
+        cmds.setAttr(src_mesh + ".v", True)
+
+    if cmds.attributeQuery("adpose_orig_vis_lock", node=src_mesh, exists=True):
+        if cmds.getAttr(src_mesh + ".adpose_orig_vis_lock"):
+            cmds.setAttr(src_mesh + ".v", lock=True)
+        cmds.deleteAttr(src_mesh, at="adpose_orig_vis_lock")
+
+def driver_polygon_vis(attr, polygon, dup):
+    store_and_unlock_visibility(polygon, dup)
+    cmds.setDrivenKeyframe(polygon + ".v", cd=attr, dv=0.0, v=1, itt="linear", ott="linear")
+    cmds.setDrivenKeyframe(polygon + ".v", cd=attr, dv=0.99, v=1, itt="linear", ott="linear")
+    cmds.setDrivenKeyframe(polygon + ".v", cd=attr, dv=1.0, v=0, itt="linear", ott="linear")
+    cmds.setDrivenKeyframe(dup + ".v", cd=attr, dv=0.0, v=0, itt="linear", ott="linear")
+    cmds.setDrivenKeyframe(dup + ".v", cd=attr, dv=0.99, v=0, itt="linear", ott="linear")
+    cmds.setDrivenKeyframe(dup + ".v", cd=attr, dv=1.0, v=1, itt="linear", ott="linear")
+
+def duplicate_polygon(attr, polygon):
+    target = attr.split(".")[-1]
+    dup = duplicate_polygon_by_target(target, polygon)
+    driver_polygon_vis(attr, polygon, dup)
+    return dup
+
+
+def duplicate_edit_polygon(attr, polygon):
+    dup = duplicate_polygon(attr, polygon)
+    target = attr.split(".")[-1]
+    bridge_connect(attr, polygon)
+    LEditTargetJob(dup, polygon, target)
+    wireframe_planes()
+
+
+def duplicate_edit_selected_polygons2(
+        target_names, add_pose_by_target, set_pose_by_target, preserve_current_pose=False):
+    polygons = get_selected_polygons()
+    if len(polygons) == 0:
+        return
+    if len(target_names) == 0:
+        return
+    # ★ 记录哪些 target 是新创建的（cancel 时需要清理）
+    new_targets = []
+    for polygon in polygons:
+        bs_node = find_bs(polygon)
+        if bs_node:
+            for target_name in target_names:
+                if not cmds.attributeQuery(target_name, node=bs_node, exists=True):
+                    new_targets.append(target_name)
+            break
+    # ★ 先设到 target pose 再复制，确保冻结的 dup 与 finish 时的 base 在同一 pose
+    # dup 已冻结（delete ch=True），后续 pose 变化不影响它 = WYSIWYG
+    for target_name in target_names:
+        if not preserve_current_pose:
+            set_pose_by_target(target_name)
+        for polygon in polygons:
+            duplicate_polygon_by_target(target_name, polygon)
+    attrs = []
+    for target_name in target_names:
+        attrs.append(add_pose_by_target(target_name))
+    connect_polygons(attrs, polygons)
+    # ★ 在 root 节点上存储新创建的 target 列表
+    root = "|lush_duplicate_edit"
+    if cmds.objExists(root) and new_targets:
+        if not cmds.attributeQuery("adpose_new_targets", node=root, exists=True):
+            cmds.addAttr(root, ln="adpose_new_targets", dt="string")
+        cmds.setAttr(root + ".adpose_new_targets", ",".join(new_targets), type="string")
+    duplicate_edit_polygon(attrs[0], polygons[0])
+
+
+def auto_duplicate_edit(
+        target_names, add_pose_by_target, set_pose_by_target, preserve_current_pose=False):
+    if is_on_duplicate_edit():
+        try:
+            finish_duplicate_edit(set_pose_by_target)
+        except Exception as e:
+            cmds.warning('finish_duplicate_edit error: %s' % e)
+            import traceback; traceback.print_exc()
+    else:
+        try:
+            duplicate_edit_selected_polygons2(
+                target_names, add_pose_by_target, set_pose_by_target, preserve_current_pose
+            )
+        except Exception as e:
+            if cmds.objExists("lush_duplicate_edit"):
+                cmds.delete("lush_duplicate_edit")
+            raise e
+
+def wireframe_planes():
+    panels = cmds.getPanel(all=True)
+    for panel in panels:
+        if cmds.modelPanel(panel, ex=1):
+            try:
+                cmds.modelEditor(panel, e=1, wireframeOnShaded=True)
+            except RuntimeError:
+                pass
+    cmds.select(cl=1)
+
+
+def get_bs_target_input(bs, target_name):
+    """获取属性目标输入属性"""
+    attr = bs + "." + target_name
+    inputs = cmds.listConnections(attr, s=True, d=False, p=True) or []
+    if len(inputs) != 1:
+        return None
+    return inputs[0]
+
+
+def get_attr_target_names(polygons):
+    """获取属性目标名称"""
+    target_names = []
+    input_attrs = []
+    for polygon in polygons:
+        bs = find_bs(polygon)
+        if not bs:
             continue
-        for target_name in bs.weight.elements():
-            if is_target_null(bs, target_name):
-                clear_list.append(bs.name()+"."+target_name)
-                delete_target(bs.attr(target_name))
-    return clear_list
-
-
-def delete_bs_for_points(target_names):
-    mesh_list = pm.ls(type="mesh", sl=1, o=1)
-    for mesh in mesh_list:
-        polygon = mesh.getParent()
-        data_raw = get_blend_shape_data(polygon, target_names)
-        vertices = pm.ls(sl=1, fl=1)
-        vertices_id_list = []
-        for vtx in vertices:
-            if not isinstance(vtx, pm.general.MeshVertex):
+        for target_name in get_bs_target_names(bs):
+            if target_name in target_names:
                 continue
-            if vtx.node() != mesh:
-                continue
-            vertices_id_list.append(vtx.index())
-        data_edited = data_raw
-        for target_name_num in range(len(target_names)):
-            for vtx_id in vertices_id_list:
-                if vtx_id in data_edited[target_name_num]['ids']:
-                    vtx_id_index = data_edited[target_name_num]['ids'].index(vtx_id)
-                    data_edited[target_name_num]['points'].pop(vtx_id_index)
-                    data_edited[target_name_num]['ids'].pop(vtx_id_index)
-        set_blend_shape_data(polygon, data_edited)
+            target_names.append(target_name)
+            input_attrs.append(get_bs_target_input(bs, target_name))
+    return list(zip(input_attrs, target_names))
 
 
-def init_targets(target_names):
-    polygon_list = pm.ls("*Driver", type="transform", o=1) + pm.ls(sl=1, type="transform", o=1)
-    polygon_list = filter(is_polygon, polygon_list)
-    for polygon in polygon_list:
-        bs = get_bs(polygon)
-        for target_name in target_names:
-            if not bs.hasAttr(target_name):
-                return
-            index = bs.attr(target_name).logicalIndex()
-            bs_api.init_target(bs.name(), index)
+def get_joints(polygons):
+    """获取骨骼"""
+    joints = []
+    for polygon in polygons:
+        for node in cmds.listHistory(polygon) or []:
+            if cmds.nodeType(node) == "skinCluster":
+                influences = cmds.skinCluster(node, q=True, inf=True) or []
+                for joint in influences:
+                    if joint not in joints:
+                        joints.append(joint)
+    return joints
+
+def comb_skin_bs():
+    """合并蒙皮和 blendShape"""
+    polygons = get_selected_polygons()
+    duplicate_polygons = [cmds.duplicate(polygon)[0] for polygon in polygons]
+    joints = get_joints(polygons)
+    com_polygon = cmds.polyUnite(duplicate_polygons, ch=False)[0]
+    cmds.delete(cmds.ls(duplicate_polygons))
+    if joints:
+        cmds.skinCluster(joints, com_polygon, tsb=True, mi=1)
+        cmds.select(polygons + [com_polygon])
+        cmds.copySkinWeights(noMirror=True, surfaceAssociation="closestPoint", influenceAssociation="name")
+    attr_target_names = get_attr_target_names(polygons)
+    for input_attr, target_name in attr_target_names:
+        full_point_data = []
+        for polygon in polygons:
+            point_count = cmds.polyEvaluate(polygon, v=True)
+            bs = find_bs(polygon)
+            if bs and cmds.objExists(bs+"."+target_name):
+                index = get_attr_logical_index(bs, target_name)
+                ids, points = get_ids_points(bs, index)
+                full_points = bs_api.unzip_points(ids, points, point_count)
+            else:
+                full_points = bs_api.unzip_points([], [], point_count)
+            full_point_data.append(full_points)
+        full_points = bs_api.merge_points(*full_point_data)
+        ids, points = bs_api.zip_points(full_points)
+        add_target(com_polygon, target_name)
+        set_bs_ids_points(com_polygon, target_name, ids, points)
+        if input_attr:
+            bridge_connect(input_attr, com_polygon)
+
+
+def get_bs_target_data(bs, target):
+    index = get_attr_logical_index(bs, target)
+    if index is None:
+        return None
+    ids, points = get_ids_points(bs, index)
+    ids = list(ids)
+    driver = get_bs_target_input(bs, target)
+    return dict(ids=ids, points=points, driver=driver, target=target)
+
+def set_bs_target_data(bs, data):
+    target = data["target"]
+    add_bs_target(bs, target)
+    set_bs_ids_points(bs, target, data["ids"], data["points"])
+    dst_attr = "{}.{}".format(bs, target)
+    src_attr = data["driver"]
+    if not src_attr:
+        return
+    if not cmds.isConnected(src_attr, dst_attr):
+        cmds.connectAttr(src_attr, dst_attr, f=1)
 
 
 def custom_mirror(target_names):
+    """自定义镜像"""
     if len(target_names) != 2:
         return
-    polygon_list = pm.ls("*Driver", type="transform", o=1) + pm.ls(sl=1, type="transform", o=1)
-    polygon_list = filter(is_polygon, polygon_list)
+    polygon_list = (cmds.ls("*Driver", type="transform", o=True) or []) + (cmds.ls(sl=True, type="transform", o=True) or [])
+    polygon_list = list(filter(is_polygon, polygon_list))
     target_mirrors = [target_names]
     for polygon in polygon_list:
         for src, dst in target_mirrors:
             add_target(polygon, dst)
         mirror_targets(polygon, target_mirrors)
-
-
-def cache_bs():
-    pass
-
-
-def load_bs():
-    pass
-
-
-def copy_bs_link(src_polygon, dst_polygon, target_names):
-    src_bs = get_bs(src_polygon)
-    dst_bs = get_bs(dst_polygon)
-    for target_name in target_names:
-        if not src_bs.hasAttr(target_name):
-            continue
-        add_target(dst_polygon, target_name)
-        in_attr = src_bs.attr(target_name).inputs(p=1)
-        if not in_attr:
-            continue
-        in_attr = in_attr[0]
-        if in_attr.isConnectedTo(dst_bs.attr(target_name)):
-            continue
-        in_attr.connect(dst_bs.attr(target_name))
-
-
-def copy_bs(src_polygon, dst_polygon, ids, target_names):
-    copy_bs_link(src_polygon, dst_polygon, target_names)
-    src_bs = get_bs(src_polygon)
-    dst_bs = get_bs(dst_polygon)
-    src_indexes = []
-    dst_indexes = []
-    for target_name in target_names:
-        if not src_bs.hasAttr(target_name):
-            continue
-        src_indexes.append(src_bs.attr(target_name).logicalIndex())
-        dst_indexes.append(dst_bs.attr(target_name).logicalIndex())
-    if not src_indexes:
-        return
-    reload(bs_api)
-    bs_api.cache_target_points(src_bs.name(), src_indexes)
-    bs_api.load_cache_target_points(dst_bs.name(), dst_indexes, ids)
-
-
-def get_polygon(node):
-    if node.type() == "mesh":
-        node = node.getParent()
-    if is_polygon(node):
-        return node
-
-
-def get_two_polygon_ids():
-    polygons = filter(bool, map(get_polygon, pm.ls(sl=1, o=1)))
-    if len(polygons) != 2:
-        return None, None, None
-    src_polygon, dst_polygon = polygons
-    ids = [vtx.index() for vtx in pm.ls(sl=1, fl=1) if isinstance(vtx, pm.general.MeshVertex)]
-    return src_polygon, dst_polygon, ids
-
-
-def tool_copy_bs(target_names):
-    src_polygon, dst_polygon, ids = get_two_polygon_ids()
-    copy_bs(src_polygon, dst_polygon, ids, target_names)
-
-
-def tool_part_warp_copy(warp_copy_fun):
-    def part_warp_copy_fun(*args):
-        src_polygon, dst_polygon, ids = get_two_polygon_ids()
-        pm.select(src_polygon, dst_polygon)
-        if not ids:
-            return warp_copy_fun(*args)
-        dst_bs = get_bs(dst_polygon)
-        dst_indexes = []
-        for target_name in args[0]:
-            add_target(dst_polygon, target_name)
-            dst_indexes.append(dst_bs.attr(target_name).logicalIndex())
-        bs_api.cache_target_points(dst_bs.name(), dst_indexes)
-        warp_copy_fun(*args)
-        keep_ids = range(dst_polygon.getShape().numVertices())
-        for i in ids:
-            keep_ids.remove(i)
-        # keep_ids
-        bs_api.load_cache_target_points(dst_bs.name(), dst_indexes, keep_ids)
-    return part_warp_copy_fun
-
-
-def tool_copy_targets(target_names):
-    polygons = list(filter(is_polygon, pm.ls(sl=1, type="transform")))
-    src_target_name = target_names.pop(0)
-    for polygon in polygons:
-        bs = find_bs(polygon)
-        if not bs:
-            return
-        if not bs.hasAttr(src_target_name):
-            continue
-        src_id = bs.attr(src_target_name).logicalIndex()
-        for dst_target_name in target_names:
-            if not bs.hasAttr(dst_target_name):
-                continue
-            dst_id = bs.attr(dst_target_name).logicalIndex()
-            pm.blendShape(bs, e=1, rtd=[0, dst_id])
-            pm.blendShape(bs, e=1, cd=[0, src_id, dst_id])
-

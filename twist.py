@@ -1,46 +1,59 @@
+# coding:utf-8
+"""
+扭曲变形模块
+已从 pymel 迁移到 maya.cmds
+"""
 import re
 import time
-
-import pymel.core as pm
+from maya import cmds
 import math
 from . import bs
 from . import config
 
 
 def find_node_by_name(name):
-    nodes = pm.ls(name)
+    """根据名称查找节点"""
+    nodes = cmds.ls(name)
     if len(nodes) == 1:
         return nodes[0]
-    return pm.displayInfo("can not find " + name)
+    print("can not find " + name)
+    return None
 
 
 def get_selected_polygons():
+    """获取选中的多边形"""
     polygons = []
-    for polygon in pm.selected(type="transform"):
-        shape = polygon.getShape()
-        if shape is None:
+    for polygon in cmds.ls(sl=True, type="transform") or []:
+        shapes = cmds.listRelatives(polygon, s=True, ni=True)
+        if not shapes:
             continue
-        if shape.type() != "mesh":
+        if cmds.nodeType(shapes[0]) != "mesh":
             continue
         polygons.append(polygon)
     return polygons
 
 
 def find_ctrl_by_joint(joint):
-    ctrl_list = pm.ls(config.get_ctrl_names(joint.name().split("|")[-1].split(":")[-1]), type="transform")
-    ctrl_list.sort(key=lambda x: len(x.name()))
+    """根据骨骼查找控制器"""
+    joint_name = joint.split("|")[-1].split(":")[-1]
+    ctrl_list = cmds.ls(config.get_ctrl_names(joint_name), type="transform") or []
+    ctrl_list.sort(key=lambda x: len(x))
     if len(ctrl_list) > 0:
         return ctrl_list[0]
+    return None
 
 
 def find_mirror_joint(joint):
-    joints = pm.ls(config.get_rl_names(joint.name().split("|")[-1].split(":")[-1]), type="joint")
+    """查找镜像骨骼"""
+    joint_name = joint.split("|")[-1].split(":")[-1]
+    joints = cmds.ls(config.get_rl_names(joint_name), type="joint") or []
     if len(joints) != 1:
-        return
+        return None
     return joints[0]
 
 
 class Twist(object):
+    """扭曲变形类"""
 
     def __init__(self, **kwargs):
         self.ctrl = None
@@ -67,144 +80,169 @@ class Twist(object):
         return self.ctrl
 
     def update_twist_ctrl_scale(self):
-        if self.joint.hasAttr(self.twist_ctrl_scale):
+        if cmds.attributeQuery(self.twist_ctrl_scale, node=self.joint, exists=True):
             return
         ctrl = self.find_ctrl()
         if ctrl is None:
             return
-        joint_value = self.joint.attr(self.twist_name).get()
-        ctrl_value = self.ctrl.attr("r"+self.axis.lower()).get()
+        joint_value = cmds.getAttr(self.joint + "." + self.twist_name)
+        ctrl_value = cmds.getAttr(self.ctrl + ".r" + self.axis.lower())
         if abs(joint_value) < 1.0:
             return
         if abs(ctrl_value) < 1.0:
             return
-        twist_scale = ctrl_value/joint_value
-        self.joint.addAttr(self.twist_ctrl_scale, k=1, at="double")
-        self.joint.attr(self.twist_ctrl_scale).set(twist_scale)
+        twist_scale = ctrl_value / joint_value
+        cmds.addAttr(self.joint, ln=self.twist_ctrl_scale, k=True, at="double")
+        cmds.setAttr(self.joint + "." + self.twist_ctrl_scale, twist_scale)
 
     def init_angle(self):
-        prefix = self.joint.name() + "_X_"
+        prefix = self.joint + "_X_"
         vector = [1, 0, 0]
         attr = "outputAxisX"
-        if self.joint.hasAttr(self.twist_name):
+        if cmds.attributeQuery(self.twist_name, node=self.joint, exists=True):
             return
-        rotate_matrix = pm.createNode("composeMatrix", n=prefix+"rotateMatrix")
-        self.joint.rotate.connect(rotate_matrix.inputRotate)
+        is_opm = bool(cmds.listConnections(self.joint + ".offsetParentMatrix", s=True, d=False))
+        if is_opm:
+            # OPM 模式：由于 joint.matrix 是静态的，我们需要计算 joint.matrix * joint.offsetParentMatrix
+            mult_curr = cmds.createNode("multMatrix", n=prefix + "currentMatrix")
+            cmds.connectAttr(self.joint + ".matrix", mult_curr + ".matrixIn[0]")
+            cmds.connectAttr(self.joint + ".offsetParentMatrix", mult_curr + ".matrixIn[1]")
 
-        swing_vector = pm.createNode("pointMatrixMult", n=prefix+"swingVector")
-        swing_vector.inPoint.set(vector)
-        rotate_matrix.outputMatrix.connect(swing_vector.inMatrix)
+            decomp = cmds.createNode("decomposeMatrix", n=prefix + "rotateMatrixDecompose")
+            cmds.connectAttr(mult_curr + ".matrixSum", decomp + ".inputMatrix")
+            rotate_matrix_attr = mult_curr + ".matrixSum"
+        else:
+            # 传统模式：从通道读取旋转
+            rotate_matrix = cmds.createNode("composeMatrix", n=prefix + "rotateMatrix")
+            cmds.connectAttr(self.joint + ".rotate", rotate_matrix + ".inputRotate")
+            rotate_matrix_attr = rotate_matrix + ".outputMatrix"
 
-        swing_angle = pm.createNode("angleBetween", n=prefix+"angleBetween")
-        swing_vector.output.connect(swing_angle.vector2)
-        swing_angle.vector1.set(vector)
+        swing_vector = cmds.createNode("pointMatrixMult", n=prefix + "swingVector")
+        cmds.setAttr(swing_vector + ".inPoint", *vector)
+        cmds.connectAttr(rotate_matrix_attr, swing_vector + ".inMatrix")
 
-        swing_quat = pm.createNode("eulerToQuat", n=prefix+"swingQuat")
-        swing_angle.euler.connect(swing_quat.inputRotate)
+        swing_angle = cmds.createNode("angleBetween", n=prefix + "angleBetween")
+        cmds.connectAttr(swing_vector + ".output", swing_angle + ".vector2")
+        cmds.setAttr(swing_angle + ".vector1", *vector)
 
-        swing_inverse = pm.createNode("quatInvert", n=prefix+"swingInverse")
-        swing_quat.outputQuat.connect(swing_inverse.inputQuat)
+        swing_quat = cmds.createNode("eulerToQuat", n=prefix + "swingQuat")
+        cmds.connectAttr(swing_angle + ".euler", swing_quat + ".inputRotate")
 
-        rotate_quat = pm.createNode("decomposeMatrix", n=prefix+"rotateQuat")
-        rotate_matrix.outputMatrix.connect(rotate_quat.inputMatrix)
+        swing_inverse = cmds.createNode("quatInvert", n=prefix + "swingInverse")
+        cmds.connectAttr(swing_quat + ".outputQuat", swing_inverse + ".inputQuat")
 
-        twist_quat = pm.createNode("quatProd", n=prefix+"twistQuat")
-        rotate_quat.outputQuat.connect(twist_quat.input1Quat)
-        swing_inverse.outputQuat.connect(twist_quat.input2Quat)
+        rotate_quat = cmds.createNode("decomposeMatrix", n=prefix + "rotateQuat")
+        cmds.connectAttr(rotate_matrix_attr, rotate_quat + ".inputMatrix")
 
-        axis_angle = pm.createNode("quatToAxisAngle", n=prefix+"axisAngle")
-        twist_quat.outputQuat.connect(axis_angle.inputQuat)
+        twist_quat = cmds.createNode("quatProd", n=prefix + "twistQuat")
+        cmds.connectAttr(rotate_quat + ".outputQuat", twist_quat + ".input1Quat")
+        cmds.connectAttr(swing_inverse + ".outputQuat", twist_quat + ".input2Quat")
 
-        angle_unit = pm.createNode("unitConversion", n=prefix + "angleUnit")
-        angle_unit.conversionFactor.set(180 / math.pi)
-        axis_angle.outputAngle.connect(angle_unit.input)
+        axis_angle = cmds.createNode("quatToAxisAngle", n=prefix + "axisAngle")
+        cmds.connectAttr(twist_quat + ".outputQuat", axis_angle + ".inputQuat")
 
-        multiply = pm.createNode("multiplyDivide", n=prefix+"multiply")
-        angle_unit.output.connect(multiply.input1X)
-        multiply.input2X.set(-1)
+        angle_unit = cmds.createNode("unitConversion", n=prefix + "angleUnit")
+        cmds.setAttr(angle_unit + ".conversionFactor", 180 / math.pi)
+        cmds.connectAttr(axis_angle + ".outputAngle", angle_unit + ".input")
 
-        condition = pm.createNode("condition", n=prefix + "condition")
-        axis_angle.attr(attr).connect(condition.firstTerm)
-        condition.operation.set(2)
-        angle_unit.output.connect(condition.colorIfTrueR)
-        multiply.outputX.connect(condition.colorIfFalseR)
-        self.joint.addAttr(self.twist_name, k=1, at="double", min=0, max=1)
-        condition.outColorR.connect(self.joint.attr(self.twist_name ))
+        multiply = cmds.createNode("multiplyDivide", n=prefix + "multiply")
+        cmds.connectAttr(angle_unit + ".output", multiply + ".input1X")
+        cmds.setAttr(multiply + ".input2X", -1)
+
+        condition = cmds.createNode("condition", n=prefix + "condition")
+        cmds.connectAttr(axis_angle + "." + attr, condition + ".firstTerm")
+        cmds.setAttr(condition + ".operation", 2)
+        cmds.connectAttr(angle_unit + ".output", condition + ".colorIfTrueR")
+        cmds.connectAttr(multiply + ".outputX", condition + ".colorIfFalseR")
+        cmds.addAttr(self.joint, ln=self.twist_name, k=True, at="double", min=0, max=1)
+        cmds.connectAttr(condition + ".outColorR", self.joint + "." + self.twist_name)
 
     def value_to_target_name(self, value):
         if abs(value) < 1:
-            return
-        joint_name = self.joint.name().split("|")[-1].split(":")[-1]
+            return None
+        joint_name = self.joint.split("|")[-1].split(":")[-1]
         abs_value = abs(int(round(value)))
-        name = "{joint_name}_{self.twist_name}_{plus_minus}{abs_value}"
         if value > 0:
             plus_minus = "plus"
         else:
             plus_minus = "minus"
-        name = name.format(**locals())
+        name = "{joint_name}_{self.twist_name}_{plus_minus}{abs_value}".format(**locals())
         return name
 
     def add_current_target(self):
-        self.add_target_by_value(self.joint.attr(self.twist_name).get())
-        if not self.joint.hasAttr("twistCtrlScale"):
+        target_name = self.add_target_by_value(cmds.getAttr(self.joint + "." + self.twist_name))
+        if not cmds.attributeQuery("twistCtrlScale", node=self.joint, exists=True):
             self.update_twist_ctrl_scale()
+        return self.joint + "." + target_name
+
+    def get_current_target(self):
+        target_name = self.value_to_target_name(cmds.getAttr(self.joint + "." + self.twist_name))
+        return target_name
+
+    def has_target(self, target):
+        return cmds.objExists(self.joint+"."+target)
 
     def add_target_by_value(self, value):
         target_name = self.value_to_target_name(value)
-        if not self.joint.hasAttr(target_name):
+        if not cmds.attributeQuery(target_name, node=self.joint, exists=True):
             values = self.get_values()
             values.append(value)
             self.update_values(values)
         return target_name
 
     def edit_target(self, target_name):
-        if not self.joint.hasAttr(target_name):
+        if not cmds.attributeQuery(target_name, node=self.joint, exists=True):
             return
-        if abs(self.joint.attr(target_name).get() - 1) > 0.01:
+        if abs(cmds.getAttr(self.joint + "." + target_name) - 1) > 0.01:
             return
         polygons = get_selected_polygons()
         src, dst = polygons
-        bs.bridge_connect_edit(self.joint.attr(target_name), src, dst)
+        bs.bridge_connect_edit(self.joint + "." + target_name, src, dst)
 
     def update_values(self, values):
-        sort_values = sorted(values+[-180.0, 0, 180.0])
+        sort_values = sorted(values + [-180.0, 0, 180.0])
         for value in values:
             if value in [-180.0, 0, 180.0]:
                 continue
             name = self.value_to_target_name(value)
-            if not self.joint.hasAttr(name):
-                self.joint.addAttr(name, k=1, at="double", min=0, max=1)
+            if not cmds.attributeQuery(name, node=self.joint, exists=True):
+                cmds.addAttr(self.joint, ln=name, k=True, at="double", min=0, max=1)
             i = sort_values.index(value)
-            pm.delete(self.joint.attr(name).inputs())
-            cd = self.joint.attr(self.twist_name)
-            attr = self.joint.attr(name)
-            pm.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i-1], v=0, itt="linear", ott="linear")
-            pm.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i], v=1, itt="linear", ott="linear")
-            pm.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i+1], v=0, itt="linear", ott="linear")
-            if sort_values[i-1] == -180.0:
-                pm.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i - 1], v=1, itt="linear", ott="linear")
+            attr = self.joint + "." + name
+            # 删除输入连接
+            inputs = cmds.listConnections(attr, s=True, d=False) or []
+            if inputs:
+                cmds.delete(inputs)
+            cd = self.joint + "." + self.twist_name
+            cmds.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i - 1], v=0, itt="linear", ott="linear")
+            cmds.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i], v=1, itt="linear", ott="linear")
+            cmds.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i + 1], v=0, itt="linear", ott="linear")
+            if sort_values[i - 1] == -180.0:
+                cmds.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i - 1], v=1, itt="linear", ott="linear")
             if sort_values[i + 1] == 180.0:
-                pm.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i + 1], v=1, itt="linear", ott="linear")
+                cmds.setDrivenKeyframe(attr, cd=cd, dv=sort_values[i + 1], v=1, itt="linear", ott="linear")
 
     def get_value_by_target(self, target_name):
-        if not self.joint.hasAttr(target_name):
-            return
-        uu = self.joint.attr(target_name).inputs(type="animCurveUU")
+        if not cmds.attributeQuery(target_name, node=self.joint, exists=True):
+            return None
+        attr = self.joint + "." + target_name
+        uu = cmds.listConnections(attr, s=True, d=False, type="animCurveUU") or []
         if len(uu) != 1:
-            return
-        uu = uu[0]
-        value = pm.keyframe(uu, floatChange=1, q=1, index=1)[0]
-        return value
+            return None
+        value = cmds.keyframe(uu[0], floatChange=True, q=True, index=(1, 1))
+        if value:
+            return value[0]
+        return None
 
     def get_values(self):
         values = []
-        joint_name = self.joint.name().split("|")[-1].split(":")[-1]
+        joint_name = self.joint.split("|")[-1].split(":")[-1]
         prefix = "{joint_name}_{self.twist_name}_".format(**locals())
-        for attr in self.joint.listAttr(ud=1):
-            target_name = attr.name().split(".")[-1]
-            if not target_name.startswith(prefix):
+        attrs = cmds.listAttr(self.joint, ud=True) or []
+        for attr_name in attrs:
+            if not attr_name.startswith(prefix):
                 continue
-            value = self.get_value_by_target(target_name)
+            value = self.get_value_by_target(attr_name)
             if value is None:
                 continue
             values.append(value)
@@ -212,28 +250,37 @@ class Twist(object):
 
     def delete_targets(self, targets):
         for target_name in targets:
-            for bs_node in self.joint.attr(target_name).outputs(type="blendShape"):
-                bs.delete_target(bs_node.attr(target_name))
-            pm.delete(self.joint.attr(target_name).inputs())
-            pm.deleteAttr(self.joint.attr(target_name))
+            attr = self.joint + "." + target_name
+            # 删除连接的 blendShape 目标
+            bs_nodes = cmds.listConnections(attr, s=False, d=True, type="blendShape") or []
+            for bs_node in bs_nodes:
+                bs.delete_target(bs_node, target_name)
+            # 删除输入连接
+            inputs = cmds.listConnections(attr, s=True, d=False) or []
+            if inputs:
+                cmds.delete(inputs)
+            cmds.deleteAttr(attr)
         self.update_values(self.get_values())
 
     def to_target(self, target_name, ib):
         if self.find_ctrl() is None:
             return
-        if not self.joint.hasAttr(target_name):
+        if not cmds.attributeQuery(target_name, node=self.joint, exists=True):
             return
-        uu = self.joint.attr(target_name).inputs(type="animCurveUU")
+        attr = self.joint + "." + target_name
+        uu = cmds.listConnections(attr, s=True, d=False, type="animCurveUU") or []
         if len(uu) != 1:
             return
-        uu = uu[0]
-        value = pm.keyframe(uu, floatChange=1, q=1, index=1)[0]
+        value = cmds.keyframe(uu[0], floatChange=True, q=True, index=(1, 1))
+        if not value:
+            return
+        value = value[0]
         scale = 1.0
-        if self.joint.hasAttr(self.twist_ctrl_scale):
-            scale = self.joint.attr(self.twist_ctrl_scale).get()
+        if cmds.attributeQuery(self.twist_ctrl_scale, node=self.joint, exists=True):
+            scale = cmds.getAttr(self.joint + "." + self.twist_ctrl_scale)
         real_value = value * ib / 60.0 * scale
-        self.ctrl.r.set(0, 0, 0)
-        self.ctrl.attr("r"+self.axis.lower()).set(real_value)
+        cmds.setAttr(self.ctrl + ".r", 0, 0, 0)
+        cmds.setAttr(self.ctrl + ".r" + self.axis.lower(), real_value)
 
     def mirror_target(self, target_names, polygons):
         names = []
@@ -244,65 +291,130 @@ class Twist(object):
         for target_name in target_names:
             value = self.get_value_by_target(target_name)
             if value is None:
-                return
+                return names
             mirror_target_name = mirror.add_target_by_value(value)
             names.append([target_name, mirror_target_name])
             for polygon in polygons:
-                bs.bridge_connect(mirror.joint.attr(mirror_target_name), polygon)
-        if mirror.joint.hasAttr(mirror.twist_ctrl_scale):
+                bs.bridge_connect(mirror.joint + "." + mirror_target_name, polygon)
+        if cmds.attributeQuery(mirror.twist_ctrl_scale, node=mirror.joint, exists=True):
             return names
-        if not self.joint.hasAttr(self.twist_ctrl_scale):
+        if not cmds.attributeQuery(self.twist_ctrl_scale, node=self.joint, exists=True):
             return names
-        mirror.joint.addAttr(mirror.twist_ctrl_scale, k=1, at="double")
-        mirror.joint.attr(mirror.twist_ctrl_scale).set(self.joint.attr(self.twist_ctrl_scale).get())
+        cmds.addAttr(mirror.joint, ln=mirror.twist_ctrl_scale, k=True, at="double")
+        cmds.setAttr(mirror.joint + "." + mirror.twist_ctrl_scale,
+                     cmds.getAttr(self.joint + "." + self.twist_ctrl_scale))
         return names
+
+    def get_targets(self):
+        joint_name = self.joint
+        axis = self.axis
+        target_re = r"^{joint_name}_twist{axis}_(plus|minus)[0-9]+$".format(**locals())
+        target_names = []
+        attrs = cmds.listAttr(self.joint) or []
+        for attr_name in attrs:
+            if re.match(target_re, attr_name):
+                target_names.append(attr_name)
+        return target_names
 
 
 def get_joints_by_joint_query(joint_query):
+    """根据查询获取骨骼列表"""
     ls_field = [field for field in joint_query.split(",") if field]
     if len(ls_field) == 0:
         return []
-    return pm.ls(ls_field, type="joint")
+    return cmds.ls(ls_field, type="joint") or []
 
 
-def add_target(joint_query, ctrl=None):
-    if not pm.pluginInfo("matrixNodes", q=1, l=1):
-        pm.loadPlugin("matrixNodes")
-    if not pm.pluginInfo("quatNodes", q=1, l=1):
-        pm.loadPlugin("quatNodes")
+def get_twist(joint_query, ctrl=None):
+    """添加目标"""
+    if not cmds.pluginInfo("matrixNodes", q=True, l=True):
+        cmds.loadPlugin("matrixNodes")
+    if not cmds.pluginInfo("quatNodes", q=True, l=True):
+        cmds.loadPlugin("quatNodes")
     joints = get_joints_by_joint_query(joint_query)
     has_rotate_joints = []
     for joint in joints:
-        rotate = sum([abs(xyz) for xyz in joint.r.get()])
-        if rotate > 0.00001:
+        rotate = cmds.getAttr(joint + ".r")[0]
+        rotate_sum = sum([abs(xyz) for xyz in rotate])
+        if rotate_sum > 0.00001:
             has_rotate_joints.append(joint)
     if len(has_rotate_joints) != 1:
-        return pm.warning("please load one rotate joint")
+        cmds.warning("please load one rotate joint")
+        return
     joint = has_rotate_joints[0]
     if ctrl is not None:
         ctrl = find_node_by_name(ctrl)
     twist = Twist(joint=joint, ctrl=ctrl)
-    twist.add_current_target()
-
-
-def get_joint_by_target(target):
-    if not target:
-        return
-    match = re.match(r"^(?P<joint>\w+)_twistX_(plus|minus)[0-9]{1,3}$", target)
-    if not match:
-        return
-    joint_name = match.groupdict()["joint"]
-    return find_node_by_name(joint_name)
+    return twist
 
 
 def edit_target(target_name):
+    """编辑目标"""
     joint = get_joint_by_target(target_name)
     if joint is None:
         return
     Twist(joint=joint).edit_target(target_name)
 
 
-def to_target(target_name, ib):
+def add_edit_target(joint_query):
+    polygons = get_selected_polygons()
+    twist = get_twist(joint_query)
+    if twist is None:
+        return
+    target = twist.get_current_target()
+
+    if not twist.has_target(target):
+        twist.add_current_target()
+    else:
+        twist.to_target(target, 60)
+    if not len(polygons) == 2:
+        return
+    cmds.select(polygons)
+    twist.edit_target(target)
+
+
+def auto_insert_pose(joint_query):
+    twist = get_twist(joint_query)
+    if twist is None:
+        return
+    target_name = twist.get_current_target()
+    if target_name is None:
+        return
+    polygons = []
+    for target in twist.get_targets():
+        attr = twist.joint + "." + target
+        for _bs in cmds.listConnections(attr, type="blendShape") or []:
+            geo = cmds.blendShape(_bs, q=True, g=True)
+            parent = cmds.listRelatives(geo[0], p=1)
+            if not parent:
+                continue
+            polygon = parent[0]
+            polygons.append(polygon)
+    if not polygons:
+        return
+    dup_polygons = []
+    for polygon in polygons:
+        dup_polygons.append(cmds.duplicate(polygon)[0])
+    attr = twist.add_current_target()
+    for src, dst in zip(dup_polygons, polygons):
+        bs.bridge_connect_edit(attr, src, dst)
+    cmds.delete(dup_polygons)
+
+
+def get_joint_by_target(target):
+    """根据目标名称获取骨骼"""
+    if not target:
+        return None
+    match = re.match(r"^(?P<joint>\w+)_twistX_(plus|minus)[0-9]{1,3}$", target)
+    if not match:
+        return None
+    joint_name = match.groupdict()["joint"]
+    return find_node_by_name(joint_name)
+
+
+
+def to_target(target_name, ib=60):
+    """设置目标姿势"""
     joint = get_joint_by_target(target_name)
     if joint is None:
         return
@@ -310,14 +422,16 @@ def to_target(target_name, ib):
 
 
 def del_targets(target_names):
+    """删除目标"""
     for target_name in target_names:
         joint = get_joint_by_target(target_name)
         if joint is None:
-            return
+            continue
         Twist(joint=joint).delete_targets([target_name])
 
 
 def mirror_targets(target_names):
+    """镜像目标"""
     polygons = get_selected_polygons()
     joint_targets = {}
     for target_name in target_names:
@@ -326,225 +440,147 @@ def mirror_targets(target_names):
             continue
         joint_targets.setdefault(joint, []).append(target_name)
     target_mirrors = []
-    for joint, target_names in joint_targets.items():
-        target_mirrors += Twist(joint=joint).mirror_target(target_names, polygons)
+    for joint, names in joint_targets.items():
+        target_mirrors += Twist(joint=joint).mirror_target(names, polygons)
     for polygon in polygons:
         bs.mirror_targets(polygon, target_mirrors)
 
 
 def get_targets():
+    """获取所有扭曲目标"""
     axis = "X"
     target_names = []
-    for joint in pm.ls(type="joint"):
-        if not joint.hasAttr("twist"+axis):
+    for joint in cmds.ls(type="joint") or []:
+        if not cmds.attributeQuery("twist" + axis, node=joint, exists=True):
             continue
-        joint_name = joint.name().split("|")[-1].split(":")[-1]
+        joint_name = joint.split("|")[-1].split(":")[-1]
         target_re = r"^{joint_name}_twist{axis}_(plus|minus)[0-9]+$".format(**locals())
-        for attr in joint.listAttr():
-            target_name = attr.name().split(".")[-1]
-            if re.match(target_re, target_name):
-                target_names.append(target_name)
+        attrs = cmds.listAttr(joint) or []
+        for attr_name in attrs:
+            if re.match(target_re, attr_name):
+                target_names.append(attr_name)
     return target_names
 
 
+
 def create_group(n="|FaceGroup|SkeletonGroup", d=False, v=None, i=None):
+    """创建组"""
     if d:
-        if pm.objExists(n):
-            pm.delete(n)
-    if pm.objExists(n):
-        return pm.PyNode(n)
+        if cmds.objExists(n):
+            cmds.delete(n)
+    if cmds.objExists(n):
+        return n
     fields = n.split("|")
     n = fields.pop(-1)
     if len(fields) > 1:
-        result = pm.group(em=1, n=n, p=create_group("|".join(fields)))
+        result = cmds.group(em=True, n=n, p=create_group("|".join(fields)))
     else:
-        result = pm.group(em=1, n=n)
+        result = cmds.group(em=True, n=n)
     if v is not None:
-        result.v.set(v)
+        cmds.setAttr(result + ".v", v)
     if i is not None:
-        result.inheritsTransform.set(i)
+        cmds.setAttr(result + ".inheritsTransform", i)
     return result
 
 
-def dup_target(target_name, polygons):
-    create_group("|adPoses").v.set(1)
-    group = create_group("|adPoses|edit_" + target_name, d=True, v=True)
-    for polygon in polygons:
-        polygon.v.set(0)
-        dup = polygon.duplicate()[0]
-        for shape in dup.getShapes():
-            if shape.io.get():
-                pm.delete(shape)
-        dup.setParent(group)
-        dup.rename(target_name+"_"+polygon.name().split("|")[-1])
-        dup.v.set(1)
-        for shape in dup.getShapes():
-            shape.overrideEnabled.set(True)
-            shape.overrideColor.set(13)
-    panels = pm.getPanel(all=True)
-    for panel in panels:
-        if pm.modelPanel(panel, ex=1):
-            pm.modelEditor(panel, e=1, wireframeOnShaded=True)
-    pm.select(cl=1)
-
-
-def auto_dup(target_name):
-    polygons = get_selected_polygons()
-    if len(polygons) == 0:
-        return
-    dup_target(target_name, polygons)
-
-
-def edit_by_duplicate(duplicate, attr, edit=True):
-    target_name = attr.name().split(".")[-1]
-    src_polygons = bs.get_name_polygon_by_short_name(bs.get_child_polygons(duplicate))
-    src_polygons = {k[len(target_name)+1:]: v for k, v in src_polygons.items()}
-    dst_polygons = bs.get_name_polygon_by_short_name(pm.ls(src_polygons.keys()))
-    for src, dst in bs.get_polygon_matrix_by_map([src_polygons, dst_polygons]):
-        dst.v.set(True)
-        if edit:
-            bs.bridge_connect_edit(attr, src, dst)
-
-    duplicate.v.set(0)
-    duplicate.getParent().v.set(0)
-    pm.select(cl=True)
-
-
-def auto_edit():
-    group = create_group("|adPoses")
-    for duplicate in group.listRelatives():
-        if not duplicate.v.get():
-            continue
-        target_name = duplicate.name()
-        if target_name[:5] != "edit_":
-            continue
-        target_name = target_name[5:]
-        joint = get_joint_by_target(target_name)
-        edit_by_duplicate(duplicate, joint.attr(target_name), True)
-
-
-def auto_apply_old(target_name):
-    selected = pm.selected()
-    if not pm.objExists("|adPoses"):
-        create_group("|adPoses").v.set(0)
-        pm.select(selected)
-    group = create_group("|adPoses")
-    if group.v.get():
-        return auto_edit()
-    else:
-        return auto_dup(target_name)
-
-
-def auto_apply(target_name):
-    from . import bsv2
-    joint = get_joint_by_target(target_name)
-    bsv2.auto_duplicate_edit([joint.attr(target_name).name()], lambda x: to_target(x, 60))
-
-
 def get_twist_data():
+    """获取扭曲数据"""
     axis = "X"
     data = []
-    for joint in pm.ls(type="joint"):
-        if not joint.hasAttr("twist"+axis):
+    for joint in cmds.ls(type="joint") or []:
+        if not cmds.attributeQuery("twist" + axis, node=joint, exists=True):
             continue
         twist = Twist(joint=joint)
-        joint_name = joint.name().split("|")[-1].split(":")[-1]
+        joint_name = joint.split("|")[-1].split(":")[-1]
         target_re = r"^{joint_name}_twist{axis}_(plus|minus)[0-9]+$".format(**locals())
-        for attr in joint.listAttr():
-            target_name = attr.name().split(".")[-1]
-            if re.match(target_re, target_name):
-                joint_name = joint.name()
-                value = twist.get_value_by_target(target_name)
+        attrs = cmds.listAttr(joint) or []
+        for attr_name in attrs:
+            if re.match(target_re, attr_name):
+                value = twist.get_value_by_target(attr_name)
                 data.append(dict(
-                    target_name=target_name,
-                    joint_name=joint_name,
+                    target_name=attr_name,
+                    joint_name=joint,
                     value=value,
                 ))
     return data
 
 
-current_time = None
-
-
-def get_blend_shapes(polygons):
-    blend_shapes = []
-    for polygon in polygons:
-        for _bs in pm.listHistory(polygon, type="blendShape"):
-            blend_shapes.append(_bs)
-    return blend_shapes
-
-
-def connect_bs(attr, bs_node):
-    target_name = attr.name().split(".")[-1]
-    if not bs_node.hasAttr(target_name):
-        return
-    dst_attr = bs_node.attr(target_name)
-    if attr.isConnectedTo(dst_attr):
-        return
-    attr.connect(dst_attr, f=1)
-
-
-def connect_all_bs(attr, blend_shapes):
-    for bs_node in blend_shapes:
-        connect_bs(attr, bs_node)
-
-
-def set_twist_data(data, polygons):
-    blend_shapes = get_blend_shapes(polygons)
+def set_twist_data(data):
+    """设置扭曲数据"""
     for row in data:
-        if not pm.objExists(row["joint_name"]):
+        if not cmds.objExists(row["joint_name"]):
             continue
-        joint = pm.PyNode(row["joint_name"])
+        joint = row["joint_name"]
         twist = Twist(joint=joint)
-        if not twist.ctrl.hasAttr(twist.twist_ctrl_scale):
-            twist.ctrl.rx.set(90)
+        if not cmds.attributeQuery(twist.twist_ctrl_scale, node=twist.ctrl, exists=True):
+            cmds.setAttr(twist.ctrl + ".rx", 90)
             twist.update_twist_ctrl_scale()
-            twist.ctrl.rx.set(0)
+            cmds.setAttr(twist.ctrl + ".rx", 0)
         twist.add_target_by_value(row["value"])
-        connect_all_bs(joint.attr(row["target_name"]), blend_shapes)
 
 
 def wrap_copy_targets_twist(targets):
+    """包裹复制扭曲目标"""
     polygons = get_selected_polygons()
     if not len(polygons) == 2:
-        return pm.warning("please selected two polygon")
-    targets = [t for t in targets if "_COMB_" not in t]+[t for t in targets if "_COMB_" in t]
+        cmds.warning("please selected two polygon")
+        return
     src, dst = polygons
-    for target in targets:
-        to_target(target, 0)
-    pm.refresh()
-    wrap = dst.duplicate()[0]
+    all_to_zero()
+    cmds.refresh()
+    wrap = cmds.duplicate(dst)[0]
     bs.get_orig(wrap)
-    pm.select(wrap, src)
-    pm.mel.CreateWrap()
+    cmds.select(wrap, src)
+    from maya import mel
+    mel.eval('CreateWrap')
     for target in targets:
         to_target(target, 60)
-        pm.select(wrap, dst)
+        cmds.select(wrap, dst)
         edit_target(target)
-        pm.refresh()
-    for target in targets:
-        to_target(target,0)
-    pm.delete(wrap)
+        cmds.refresh()
+        to_target(target, 0)
+    cmds.delete(wrap)
 
 
-def custom_mirror(target_names):
-    if len(target_names) != 2:
+def auto_apply(joints):
+    """自动应用"""
+    selected = cmds.ls(sl=1)
+    twist = get_twist(joints)
+    if twist is None:
         return
-    polygons = get_selected_polygons()
-    driver = pm.ls("*|Planes|Driver", type="transform")
-    if len(driver) == 1:
-        polygons.append(driver[0])
-    target_mirrors = [target_names]
-    for polygon in polygons:
-        _bs = bs.get_bs(polygon)
-        for src, dst in target_mirrors:
-            if not _bs.hasAttr(src):
-                continue
-            joint = get_joint_by_target(dst)
-            if _bs.hasAttr(dst):
-                if joint.attr(dst).isConnectedTo(_bs.attr(dst)):
-                    continue
-                else:
-                    bs.delete_target(_bs.attr(dst))
-            bs.bridge_connect(joint.attr(dst), polygon)
-        bs.mirror_targets(polygon, target_mirrors)
+    target_name = twist.get_current_target()
+    if target_name is None:
+        if bs.is_on_duplicate_edit():
+            bs.finish_duplicate_edit(to_target)
+        return
+    def _add_target(_target_name):
+        return twist.add_current_target()
+    def _set_target(_target_name):
+        pass
+    cmds.select(cmds.ls(selected))
+    bs.auto_duplicate_edit([target_name], _add_target, _set_target)
+
+
+def all_to_zero():
+    axis = "X"
+    for joint in cmds.ls(type="joint") or []:
+        if not cmds.attributeQuery("twist" + axis, node=joint, exists=True):
+            continue
+        joint_name = joint.split("|")[-1].split(":")[-1]
+        target_re = r"^{joint_name}_twist{axis}_(plus|minus)[0-9]+$".format(**locals())
+        attrs = cmds.listAttr(joint) or []
+        for attr_name in attrs:
+            if re.match(target_re, attr_name):
+                ctrl = find_ctrl_by_joint(joint)
+                if ctrl:
+                    rotate = cmds.getAttr(ctrl + ".rotate")[0]
+                    if not all([abs(i) < 0.00001 for i in rotate]):
+                        identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+                        cmds.xform(ctrl, m=identity, ws=False)
+                        break
+
+
+def esc():
+    if bs.is_on_duplicate_edit():
+        bs.finish_duplicate_edit(to_target)
+    all_to_zero()

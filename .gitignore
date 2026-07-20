@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+.idea/
+.vscode/
+
+_codex_*.json
+test_result*.json
+*.log
+*.tmp
+*.bak
+
+*.ma
+*.mb

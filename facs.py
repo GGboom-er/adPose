@@ -1,97 +1,118 @@
 # coding:utf-8
-import pymel.core as pm
+"""
+FACS 面部动作编码系统模块
+已从 pymel 迁移到 maya.cmds
+"""
+from maya import cmds
 from . import config
 import re
 from . import bs
 import json
 
 
-def get_target_name(attr, default, value):
+def get_target_name(node, attr_name, default, value):
+    """获取目标名称"""
     if value > default:
         suffix = "max"
     else:
         suffix = "min"
-    ctrl_name = attr.node().name().split("|")[-1].split(":")[-1]
-    attr_name = attr.name(longName=0).split(".")[-1]
+    ctrl_name = node.split("|")[-1].split(":")[-1]
     return "_".join([ctrl_name, attr_name, suffix])
 
-
-def find_add_sdk_data():
-    data = []
-    for ctrl in pm.selected(type="transform"):
-        for trs in "trs":
-            for xyz in "xyz":
-                attr = ctrl.attr(trs + xyz)
-                value = ctrl.attr(trs+xyz).get()
-                default = dict(t=0, r=0, s=1)[trs]
-                if abs(default-value) < 0.001:
-                    continue
-                target_name = get_target_name(attr, default, value)
-                data.append(dict(attr=attr, value=value, default_value=default, target_name=target_name))
-        for attr in ctrl.listAttr(ud=1):
-            if pm.addAttr(attr, q=1, at=1) != "double":
-                continue
-            default = pm.addAttr(attr, q=1, dv=1)
-            value = attr.get()
+def get_ctrl_sdk_data(ctrl, data=None):
+    if data is None:
+        data = []
+    for trs in "trs":
+        for xyz in "xyz":
+            attr_name = trs + xyz
+            attr = ctrl + "." + attr_name
+            value = cmds.getAttr(attr)
+            default = dict(t=0, r=0, s=1)[trs]
             if abs(default - value) < 0.001:
                 continue
-            target_name = get_target_name(attr, default, value)
+            target_name = get_target_name(ctrl, attr_name, default, value)
             data.append(dict(attr=attr, value=value, default_value=default, target_name=target_name))
+    # 用户定义属性
+    ud_attrs = cmds.listAttr(ctrl, ud=True) or []
+    for attr_name in ud_attrs:
+        attr = ctrl + "." + attr_name
+        attr_type = cmds.addAttr(attr, q=True, at=True)
+        if attr_type != "double":
+            continue
+        default = cmds.addAttr(attr, q=True, dv=True)
+        value = cmds.getAttr(attr)
+        if abs(default - value) < 0.001:
+            continue
+        target_name = get_target_name(ctrl, attr_name, default, value)
+        data.append(dict(attr=attr, value=value, default_value=default, target_name=target_name))
+
+
+def find_add_sdk_data(ctrls):
+    """查找添加 SDK 数据"""
+    data = []
+    for ctrl in ctrls:
+        get_ctrl_sdk_data(ctrl, data)
     return data
 
 
 def get_bridge():
-    if pm.objExists("CtrlAttrBsSdkBridge"):
-        return pm.PyNode("CtrlAttrBsSdkBridge")
+    """获取或创建桥接节点"""
+    if cmds.objExists("CtrlAttrBsSdkBridge"):
+        return "CtrlAttrBsSdkBridge"
     else:
-        return pm.group(em=1, n="CtrlAttrBsSdkBridge")
+        return cmds.group(em=True, n="CtrlAttrBsSdkBridge")
 
 
 def add_sdk(attr, target_name, default_value, value):
+    """添加 SDK"""
     bridge = get_bridge()
-    if bridge.hasAttr(target_name):
-        return pm.warning(target_name + " already exists")
-    bridge.addAttr(target_name, min=0, max=1, at="double", k=1)
-    pm.setDrivenKeyframe(bridge.attr(target_name), cd=attr, dv=default_value, v=0, itt="linear", ott="linear")
-    pm.setDrivenKeyframe(bridge.attr(target_name), cd=attr, dv=value, v=1, itt="linear", ott="linear")
+    if cmds.attributeQuery(target_name, node=bridge, exists=True):
+        return
+    cmds.addAttr(bridge, ln=target_name, min=0, max=1, at="double", k=True)
+    bridge_attr = bridge + "." + target_name
+    cmds.setDrivenKeyframe(bridge_attr, cd=attr, dv=default_value, v=0, itt="linear", ott="linear")
+    cmds.setDrivenKeyframe(bridge_attr, cd=attr, dv=value, v=1, itt="linear", ott="linear")
 
 
 def add_sdk_by_selected():
-    u"""
-    对选择的控制器添加驱动
-    :return:
-    """
-    for kwargs in find_add_sdk_data():
+    """对选择的控制器添加驱动"""
+    for kwargs in find_add_sdk_data(cmds.ls(sl=True, type="transform") or []):
         add_sdk(**kwargs)
 
 
 def rest_ctrl(ctrl):
+    """重置控制器"""
     for trs in "trs":
-        attr = ctrl.attr(trs)
-        if attr.inputs():
+        attr = ctrl + "." + trs
+        if cmds.listConnections(attr, s=True, d=False):
             continue
-        if attr.isLocked():
+        if cmds.getAttr(attr, l=True):
             continue
         for xyz in "xyz":
-            attr = ctrl.attr(trs + xyz)
-            if attr.inputs():
+            attr = ctrl + "." + trs + xyz
+            if cmds.listConnections(attr, s=True, d=False):
                 continue
-            if attr.isLocked():
+            if cmds.getAttr(attr, l=True):
                 continue
             default = dict(t=0, r=0, s=1)[trs]
-            attr.set(default)
-    for attr in ctrl.listAttr(ud=1):
-        if pm.addAttr(attr, q=1, at=1) != "double":
+            cmds.setAttr(attr, default)
+    # 用户定义属性
+    ud_attrs = cmds.listAttr(ctrl, ud=True) or []
+    for attr_name in ud_attrs:
+        attr = ctrl + "." + attr_name
+        attr_type = cmds.addAttr(attr, q=True, at=True)
+        if attr_type != "double":
             continue
-        if attr.inputs():
+        if cmds.listConnections(attr, s=True, d=False):
             continue
-        if attr.isLocked():
+        if cmds.getAttr(attr, l=True):
             continue
-        default = pm.addAttr(attr, q=1, dv=1)
-        attr.set(default)
+        default = cmds.addAttr(attr, q=True, dv=True)
+        cmds.setAttr(attr, default)
 
 
 def get_ib_by_targets(ib_names):
+    """根据目标名称获取 IB 值"""
     for ib_name in ib_names:
         match = re.match(".+_IB([0-9]{2})$", ib_name)
         if match is None:
@@ -100,360 +121,425 @@ def get_ib_by_targets(ib_names):
         return ib
     return 60
 
-
-def set_pose_by_targets(target_names, ib=60, reset_other=True):
-    orig_ib = get_ib_by_targets(target_names)
-    target_names = [name for target_name in target_names for name in re.split("_COMB_|_IB[0-9]{2}", target_name) if name]
+def to_base_target(target_name, ib=60):
     bridge = get_bridge()
-    ctrl_lists = []
-    attr_value_list = []
-    if reset_other:
-        all_targets = get_targets()
+    data = get_base_sdk_data(bridge, target_name)
+    if data is None:
+        return
+    ctrl, attr, default, value = data
+    bw = ib/60.0
+    cmds.setAttr(attr, default * (1 - bw) + value * bw)
+
+def to_comb_target(target_name, ib=60):
+    base_targets = target_name.split("_COMB_")
+    for base_target in base_targets:
+        to_base_target(base_target, ib)
+
+
+def to_ib_target(target_name, ib=60):
+    base_target = target_name[:-5]
+    if target_is_comb(base_target):
+        to_comb_target(base_target, ib=ib)
     else:
-        all_targets = target_names
-    for target_name in all_targets:
-        if not bridge.hasAttr(target_name):
-            continue
-        uu = bridge.attr(target_name).inputs(type="animCurveUU")
-        if len(uu) != 1:
-            continue
-        uu = uu[0]
-        attr = uu.inputs(p=1)
-        if len(attr) != 1:
-            continue
-        attr = attr[0]
-        ctrl = attr.node()
-        if ctrl.type() == "unitConversion":
-            attr = ctrl.inputs(p=1)
-            if len(attr) != 1:
-                continue
-            attr = attr[0]
-            ctrl = attr.node()
-        if ctrl not in ctrl_lists:
-            ctrl_lists.append(ctrl)
-        if target_name not in target_names:
-            continue
-        if target_name[-4:] == "_max":
-            value = pm.keyframe(uu, floatChange=1, q=1, index=1)[0]
-        else:
-            value = pm.keyframe(uu, floatChange=1, q=1, index=0)[0]
-        attr_value_list.append([attr, value])
-    if reset_other:
-        for ctrl in ctrl_lists:
-            rest_ctrl(ctrl)
-    for attr, value in attr_value_list:
-        attr.set(value*float(orig_ib)/60.0*float(ib)/60.0)
+        _ib = get_ib_by_targets([target_name])
+        to_base_target(base_target, ib=_ib*ib/60.0)
+
+def to_targets(target_names, ib=60):
+    for target in target_names:
+        if target_is_base(target):
+            to_base_target(target, ib=ib)
+        elif target_is_ib(target):
+            to_ib_target(target, ib=ib)
+        elif target_is_comb(target):
+            to_comb_target(target, ib=ib)
 
 
 def get_targets():
-    if not pm.objExists("CtrlAttrBsSdkBridge"):
+    """获取所有目标"""
+    if not cmds.objExists("CtrlAttrBsSdkBridge"):
         return []
-    return [attr.name(includeNode=False) for attr in get_bridge().listAttr(ud=1)]
+    bridge = get_bridge()
+    ud_attrs = cmds.listAttr(bridge, ud=True) or []
+    return ud_attrs
 
 
 def get_selected_polygons():
+    """获取选中的多边形"""
     polygons = []
-    for polygon in pm.selected(type="transform"):
-        shape = polygon.getShape()
-        if shape is None:
+    for polygon in cmds.ls(sl=True, type="transform") or []:
+        shapes = cmds.listRelatives(polygon, s=True, ni=True)
+        if not shapes:
             continue
-        if shape.type() != "mesh":
+        if cmds.nodeType(shapes[0]) != "mesh":
             continue
         polygons.append(polygon)
     return polygons
 
 
 def edit_target(target_name):
+    """编辑目标"""
     selected = get_selected_polygons()
     if len(selected) != 2:
-        return pm.warning("please selected two polygon")
+        cmds.warning("please selected two polygon")
+        return
     bridge = get_bridge()
-    if not bridge.hasAttr(target_name):
-        return pm.warning("can not find " + target_name)
+    if not cmds.attributeQuery(target_name, node=bridge, exists=True):
+        cmds.warning("can not find " + target_name)
+        return
     src, dst = selected
-    attr = bridge.attr(target_name)
+    attr = bridge + "." + target_name
     bs.bridge_connect_edit(attr, src, dst)
 
+def exists_target(target_name):
+    bridge = get_bridge()
+    attr = bridge + "." + target_name
+    return cmds.objExists(attr)
 
 def edit_static_target(target_name):
+    """编辑静态目标"""
     selected = get_selected_polygons()
     if len(selected) != 2:
-        return pm.warning("please selected two polygon")
+        cmds.warning("please selected two polygon")
+        return
     bridge = get_bridge()
-    if not bridge.hasAttr(target_name):
-        return pm.warning("can not find " + target_name)
+    if not cmds.attributeQuery(target_name, node=bridge, exists=True):
+        cmds.warning("can not find " + target_name)
+        return
     src, dst = selected
-    attr = bridge.attr(target_name)
+    attr = bridge + "." + target_name
     bs.bridge_static_connect_edit(attr, src, dst)
 
 
 def add_comb(target_names):
+    """添加组合目标"""
     comb_name = "_COMB_".join(list(sorted(target_names)))
     bridge = get_bridge()
-    if bridge.hasAttr(comb_name):
-        return pm.warning(comb_name + " already exists")
+    if cmds.attributeQuery(comb_name, node=bridge, exists=True):
+        return
     for target_name in target_names:
-        if not bridge.hasAttr(target_name):
-            return pm.warning("can not find " + target_name)
-        if not bridge.inputs():
-            return pm.warning("can not find " + target_name + "inputs")
-    bridge.addAttr(comb_name, min=0, max=1, at="double", k=1)
-    com = pm.createNode("combinationShape", n=comb_name)
-    com.outputWeight.connect(bridge.attr(comb_name))
-    com.combinationMethod.set(1)
+        if not cmds.attributeQuery(target_name, node=bridge, exists=True):
+            cmds.warning("can not find " + target_name)
+            return
+        attr = bridge + "." + target_name
+        if not cmds.listConnections(attr, s=True, d=False):
+            cmds.warning("can not find " + target_name + " inputs")
+            return
+    cmds.addAttr(bridge, ln=comb_name, min=0, max=1, at="double", k=True)
+    com = cmds.createNode("combinationShape", n=comb_name)
+    cmds.connectAttr(com + ".outputWeight", bridge + "." + comb_name)
+    cmds.setAttr(com + ".combinationMethod", 1)
     for i, target_name in enumerate(target_names):
-        bridge.attr(target_name).inputs(p=1)[0].connect(com.inputWeight[i])
+        attr = bridge + "." + target_name
+        input_attrs = cmds.listConnections(attr, s=True, d=False, p=True) or []
+        if input_attrs:
+            cmds.connectAttr(input_attrs[0], com + ".inputWeight[{}]".format(i))
 
 
 def update_ib(target_name):
+    """更新 IB"""
     bridge = get_bridge()
-    if not bridge.hasAttr(target_name):
-        return pm.warning("can not find" + target_name)
+    if not cmds.attributeQuery(target_name, node=bridge, exists=True):
+        cmds.warning("can not find " + target_name)
+        return
     ibs = []
     for ib_name in get_targets():
-        match = re.match(target_name+"_IB([0-9]{2})$", ib_name)
+        match = re.match(target_name + "_IB([0-9]{2})$", ib_name)
         if match is None:
             continue
         ib = int(match.groups()[0])
         ibs.append(ib)
     ibs = list(sorted(ibs))
     ibs = [0] + ibs + [60]
-    for i in range(len(ibs)-2):
-        ib_name = target_name + "_IB%02d" % ibs[i+1]
-        pm.delete(bridge.attr(ib_name).inputs())
-        for dv, v in zip([1.0/60.0*ibs[i+j] for j in range(3)], [0, 1, 0]):
-            pm.setDrivenKeyframe(bridge.attr(ib_name), cd=bridge.attr(target_name), dv=dv, v=v, itt="linear", ott="linear")
+    for i in range(len(ibs) - 2):
+        ib_name = target_name + "_IB%02d" % ibs[i + 1]
+        attr = bridge + "." + ib_name
+        inputs = cmds.listConnections(attr, s=True, d=False) or []
+        if inputs:
+            cmds.delete(inputs)
+        cd = bridge + "." + target_name
+        for dv, v in zip([1.0 / 60.0 * ibs[i + j] for j in range(3)], [0, 1, 0]):
+            cmds.setDrivenKeyframe(attr, cd=cd, dv=dv, v=v, itt="linear", ott="linear")
 
 
-def _add_ib(ib_name):
+def add_ib_by_ib_name(ib_name):
+    """添加 IB"""
     bridge = get_bridge()
     target_name = ib_name[:-5]
-    if bridge.hasAttr(ib_name):
+    if cmds.attributeQuery(ib_name, node=bridge, exists=True):
         return ib_name
-    bridge.addAttr(ib_name, min=0, max=1, at="double", k=1)
+    cmds.addAttr(bridge, ln=ib_name, min=0, max=1, at="double", k=True)
     update_ib(target_name)
     return ib_name
 
-
-def add_ib(target_name):
+def get_ib_target(target_name):
     bridge = get_bridge()
     if re.match(".+_IB[0-9]{2}$", target_name):
-        return pm.warning("can not insert in-between")
-    if not bridge.hasAttr(target_name):
-        return pm.warning("can not find" + target_name)
-    attr = bridge.attr(target_name)
-    value = attr.get()
+        return None
+    if not cmds.attributeQuery(target_name, node=bridge, exists=True):
+        return None
+    attr = bridge + "." + target_name
+    value = cmds.getAttr(attr)
     ib = int(round(value * 60))
     if ib == 60:
-        return pm.warning("can not insert ib-between 60")
+        return None
     if ib == 0:
-        return pm.warning("can not insert ib-between 0")
+        return None
     ib_name = target_name + "_IB%02d" % ib
-    _add_ib(ib_name)
+    return ib_name
 
 
-def delete_target(target_name):
-    bridge = get_bridge()
-    if not bridge.hasAttr(target_name):
-        return pm.warning("can not find" + target_name)
-    for bs_node in bridge.attr(target_name).outputs(type="blendShape"):
-        bs.delete_target(bs_node.attr(target_name))
-    pm.deleteAttr(bridge.attr(target_name))
-    match = re.match("(.+)_IB[0-9]{2}$", target_name)
-    if match is None:
+def add_current_ib(target_name):
+    """添加 IB 目标"""
+    ib_name = get_ib_target(target_name)
+    if not ib_name:
         return
-    update_ib(match.groups()[0])
+    add_ib_by_ib_name(ib_name)
 
+
+def delete_base_target(target_name):
+    bridge = get_bridge()
+    attr = bridge + "." + target_name
+    if not cmds.objExists(attr):
+        return
+    bs_nodes = cmds.listConnections(attr, s=False, d=True, type="blendShape") or []
+    for bs_node in bs_nodes:
+        bs.delete_target(bs_node, target_name)
+    cmds.deleteAttr(attr)
+
+
+def delete_ib_target(target_name):
+    delete_base_target(target_name)
+    update_ib(target_name[:-5])
+
+
+def split_targets(target_names):
+    type_targets = dict(
+        base=[],
+        comb=[],
+        ib=[]
+    )
+    for target in target_names:
+        if target_is_base(target):
+            type_targets["base"].append(target)
+        elif target_is_ib(target):
+            type_targets["ib"].append(target)
+        elif target_is_comb(target):
+            type_targets["comb"].append(target)
+    return type_targets
 
 def delete_targets(target_names):
-    for target_name in target_names:
-        delete_target(target_name)
+    """删除多个目标"""
+    all_targets = get_targets()
+    all_type = split_targets(all_targets)
+    del_type = split_targets(target_names)
+
+    for del_base in del_type["base"]:
+        for comb in all_type["comb"]:
+            # 检查这个 comb 是否包含待删除的 base 目标
+            if del_base not in comb.split("_COMB_"):
+                continue
+            if comb in del_type["comb"]:
+                continue
+            del_type["comb"].append(comb)
+
+    for del_comb in del_type["comb"]+del_type["base"]:
+        for ib in all_type["ib"]:
+            # 检查这个 ib 是否对应待删除的 comb
+            if del_comb not in ib:
+                continue
+            if ib in del_type["ib"]:
+                continue
+            del_type["ib"].append(ib)
+
+    for ib_target in del_type["ib"]:
+        delete_ib_target(ib_target)
+    for comb_target in del_type["comb"]:
+        delete_base_target(comb_target)
+    for base_target in del_type["base"]:
+        delete_base_target(base_target)
 
 
 def reset_face_ctrl():
-    for ctrl in pm.ls("FCtrl*", "*Control", type="transform"):
-        if "FaceGroup" not in ctrl.fullPath():
+    """重置面部控制器"""
+    for ctrl in cmds.ls("FCtrl*", "*Control", type="transform") or []:
+        full_path = cmds.ls(ctrl, l=True)
+        if full_path and "FaceGroup" not in full_path[0]:
             continue
         rest_ctrl(ctrl)
 
-
-def face_sdk(target_name):
-    sel = pm.selected()
-    target = pm.ls("*|Planes|Target", type="transform")
-    driver = pm.ls("*|Planes|Driver", type="transform")
-    if len(target) != 1:
-        return pm.warning("can not find target")
-    if len(driver) != 1:
-        return pm.warning("can not find driver")
-    temp = target[0].duplicate()[0]
-    pm.select(temp, driver[0])
-    reset_face_ctrl()
-    set_pose_by_targets([target_name])
-    edit_static_target(target_name)
-    pm.select(sel)
-    pm.delete(temp)
-
-
 def find_mirror_ctrl(ctrl):
-    ctrl_list = pm.ls(config.get_rl_names(ctrl.name().split("|")[-1].split(":")[-1]))
+    """查找镜像控制器"""
+    ctrl_name = ctrl.split("|")[-1].split(":")[-1]
+    ctrl_list = cmds.ls(config.get_rl_names(ctrl_name)) or []
     if len(ctrl_list) != 1:
-        return
+        return None
     return ctrl_list[0]
 
 
 def get_base_sdk_data(bridge, target_name):
-    uu = bridge.attr(target_name).inputs(type="animCurveUU")
+    """获取基础 SDK 数据"""
+    attr = bridge + "." + target_name
+    uu = cmds.listConnections(attr, s=True, d=False, type="animCurveUU") or []
     if len(uu) != 1:
-        return
+        return None
     uu = uu[0]
-    attr = uu.inputs(p=1)
-    if len(attr) != 1:
-        return
-    attr = attr[0]
-    ctrl = attr.node()
-    if ctrl.type() == "unitConversion":
-        attr = ctrl.inputs(p=1)
-        if len(attr) != 1:
-            return
-        attr = attr[0]
-        ctrl = attr.node()
+    input_attrs = cmds.listConnections(uu, s=True, d=False, p=True) or []
+    if len(input_attrs) != 1:
+        return None
+    input_attr = input_attrs[0]
+    ctrl = input_attr.split(".")[0]
+    ctrl_type = cmds.nodeType(ctrl)
+    if ctrl_type == "unitConversion":
+        input_attrs2 = cmds.listConnections(ctrl, s=True, d=False, p=True) or []
+        if len(input_attrs2) != 1:
+            return None
+        input_attr = input_attrs2[0]
+        ctrl = input_attr.split(".")[0]
+    node, attr = input_attr.split(".")
+    sn = cmds.attributeQuery(attr, node=node, sn=True)
+    input_attr = node+"."+sn
+
     if target_name[-4:] == "_max":
-        value = pm.keyframe(uu, floatChange=1, q=1, index=1)[0]
-        default_value = pm.keyframe(uu, floatChange=1, q=1, index=0)[0]
+        value = cmds.keyframe(uu, floatChange=True, q=True, index=(1, 1))
+        default_value = cmds.keyframe(uu, floatChange=True, q=True, index=(0, 0))
     else:
-        value = pm.keyframe(uu, floatChange=1, q=1, index=0)[0]
-        default_value = pm.keyframe(uu, floatChange=1, q=1, index=1)[0]
-    return ctrl, attr, default_value, value
+        value = cmds.keyframe(uu, floatChange=True, q=True, index=(0, 0))
+        default_value = cmds.keyframe(uu, floatChange=True, q=True, index=(1, 1))
+    if value and default_value:
+        return ctrl, input_attr, default_value[0], value[0]
+    return None
 
 
 def add_mirror_base_target(bridge, target_name):
-    ctrl, attr, default_value, value = get_base_sdk_data(bridge, target_name)
+    """添加镜像基础目标"""
+    result = get_base_sdk_data(bridge, target_name)
+    if result is None:
+        return None
+    ctrl, attr, default_value, value = result
     mirror_ctrl = find_mirror_ctrl(ctrl)
     if mirror_ctrl is None:
-        return
-    attr = mirror_ctrl.attr(attr.name(includeNode=False))
-    target_name = get_target_name(attr, default_value, value)
-    if not bridge.hasAttr(target_name):
-        add_sdk(attr, target_name, default_value, value)
+        return None
+    attr_name = attr.split(".")[-1]
+    mirror_attr = mirror_ctrl + "." + attr_name
+    target_name = get_target_name(mirror_ctrl, attr_name, default_value, value)
+    if not cmds.attributeQuery(target_name, node=bridge, exists=True):
+        add_sdk(mirror_attr, target_name, default_value, value)
     return target_name
 
-
-def add_mirror_target(bridge, target_name):
-    math = re.match("(.+)_IB([0-9]{2})$", target_name)
-    if math:
-        target_name = math.groups()[0]
-        ib = int(math.groups()[1])
-    else:
-        ib = None
-    target_names = [name for name in target_name.split("_COMB_") if name]
+def add_mirror_comb_target(bridge, comb_target):
+    target_names = [name for name in comb_target.split("_COMB_") if name]
     mirror_target_names = []
-    for target_name in target_names:
-        mirror_target_name = add_mirror_base_target(bridge, target_name)
+    for base_target in target_names:
+        mirror_target_name = add_mirror_base_target(bridge, base_target)
         if mirror_target_name is None:
-            mirror_target_names.append(target_name)
+            mirror_target_names.append(base_target)
         else:
             mirror_target_names.append(mirror_target_name)
     mirror_target_names = list(sorted(mirror_target_names))
     mirror_target_name = "_COMB_".join(mirror_target_names)
-    if mirror_target_name == target_name:
-        return
-    if len(mirror_target_names) > 1:
-        add_comb(mirror_target_names)
-    if ib is None:
-        return mirror_target_name
+    add_comb(mirror_target_names)
+    return mirror_target_name
+
+def add_mirror_ib_target(bridge, ib_target):
+    base_target = ib_target[:-5]
+    if target_is_comb(base_target):
+        mirror_target_name = add_mirror_comb_target(bridge, base_target)
     else:
-        ib_name = mirror_target_name + "_IB%02d" % ib
-        return _add_ib(ib_name)
+        mirror_target_name = add_mirror_base_target(bridge, base_target)
+    ib = get_ib_by_targets([ib_target])
+    ib_name = mirror_target_name + "_IB%02d" % ib
+    add_ib_by_ib_name(ib_name)
+    return ib_name
 
 
 def mirror_targets(target_names):
+    """镜像目标"""
     polygons = get_selected_polygons()
-    driver = pm.ls("*|Planes|Driver", type="transform")
+    driver = cmds.ls("*|Planes|Driver", type="transform") or []
     if len(driver) == 1:
         polygons.append(driver[0])
+
+    type_targets = split_targets(target_names)
+    for ib_target in type_targets["ib"]:
+        base_target = ib_target[:-5]
+        if target_is_comb(base_target):
+            if base_target not in type_targets["comb"]:
+                type_targets["comb"].append(base_target)
+        elif target_is_base(base_target):
+            if base_target not in type_targets["base"]:
+                type_targets["base"].append(base_target)
+
+    for comb_target in type_targets["comb"]:
+        base_targets = comb_target.split("_COMB_")
+        for base_target in base_targets:
+            if base_target not in type_targets["base"]:
+                type_targets["base"].append(base_target)
+
     bridge = get_bridge()
     target_mirrors = []
+    for base_target in type_targets["base"]:
+        mirror_target = add_mirror_base_target(bridge, base_target)
+        target_mirrors.append([base_target, mirror_target])
+    for base_target in type_targets["comb"]:
+        mirror_target = add_mirror_comb_target(bridge, base_target)
+        target_mirrors.append([base_target, mirror_target])
+    for base_target in type_targets["ib"]:
+        mirror_target = add_mirror_ib_target(bridge, base_target)
+        target_mirrors.append([base_target, mirror_target])
 
-    for target_name in target_names:
-        if not bridge.hasAttr(target_name):
+    for polygon in polygons:
+        _bs = bs.find_bs(polygon)
+        if not _bs:
             continue
-        mirror_target_name = add_mirror_target(bridge, target_name)
-        target_mirrors.append([target_name, mirror_target_name])
-    for polygon in polygons:
-        _bs = bs.get_bs(polygon)
         for src, dst in target_mirrors:
-            if not _bs.hasAttr(src):
+            if not cmds.attributeQuery(src, node=_bs, exists=True):
                 continue
-            if _bs.hasAttr(dst):
-                if bridge.attr(dst).isConnectedTo(_bs.attr(dst)):
-                    continue
-                else:
-                    bs.delete_target(_bs.attr(dst))
-            bs.bridge_connect(bridge.attr(dst), polygon)
-        bs.mirror_targets(polygon, target_mirrors)
-
-
-def custom_mirror(target_names):
-    if len(target_names) != 2:
-        return
-    polygons = get_selected_polygons()
-    driver = pm.ls("*|Planes|Driver", type="transform")
-    if len(driver) == 1:
-        polygons.append(driver[0])
-    bridge = get_bridge()
-    target_mirrors = [target_names]
-    for polygon in polygons:
-        _bs = bs.get_bs(polygon)
-        for src, dst in target_mirrors:
-            if not _bs.hasAttr(src):
-                continue
-            if _bs.hasAttr(dst):
-                if bridge.attr(dst).isConnectedTo(_bs.attr(dst)):
-                    continue
-                else:
-                    bs.delete_target(_bs.attr(dst))
-            bs.bridge_connect(bridge.attr(dst), polygon)
+            bs.bridge_connect(bridge + "." + dst, polygon)
         bs.mirror_targets(polygon, target_mirrors)
 
 
 def get_sdk_data():
+    """获取 SDK 数据"""
     bridge = get_bridge()
     data = []
-    for attr in bridge.listAttr(ud=1):
-        target_name = attr.name().split(".")[-1]
-        if target_name[-4:-2] == "IB":
+    ud_attrs = cmds.listAttr(bridge, ud=True) or []
+    for attr_name in ud_attrs:
+        if attr_name[-4:-2] == "IB":
             data.append(dict(
                 typ="ib",
-                target_name=target_name
+                target_name=attr_name
             ))
-        elif "_COMB_" in target_name:
+        elif "_COMB_" in attr_name:
             data.append(dict(
                 typ="comb",
-                target_names=[name for name in target_name.split("_COMB_") if name],
-                target_name=target_name
+                target_names=[name for name in attr_name.split("_COMB_") if name],
+                target_name=attr_name
             ))
         else:
-            ctrl, attr, default_value, value = get_base_sdk_data(bridge, target_name)
-            data.append(dict(
-                typ="base",
-                ctrl=ctrl.name(),
-                attr=attr.name().split(".")[-1],
-                default_value=default_value,
-                value=value,
-                target_name=target_name
-            ))
+            result = get_base_sdk_data(bridge, attr_name)
+            if result:
+                ctrl, attr, default_value, value = result
+                data.append(dict(
+                    typ="base",
+                    ctrl=ctrl,
+                    attr=attr.split(".")[-1],
+                    default_value=default_value,
+                    value=value,
+                    target_name=attr_name
+                ))
     return data
 
 
 def set_sdk_data(data):
+    """设置 SDK 数据"""
     for row in data:
         if row["typ"] == "base":
-            ctrl_list = pm.ls(row["ctrl"], type="transform")
+            ctrl_list = cmds.ls(row["ctrl"], type="transform") or []
             if len(ctrl_list) != 1:
                 continue
             ctrl = ctrl_list[0]
             add_sdk(
-                attr=ctrl.attr(row["attr"]),
+                attr=ctrl + "." + row["attr"],
                 target_name=row["target_name"],
                 default_value=row["default_value"],
                 value=row["value"],
@@ -463,82 +549,212 @@ def set_sdk_data(data):
             add_comb(row["target_names"])
     for row in data:
         if row["typ"] == "ib":
-            _add_ib(row["target_name"])
+            add_ib_by_ib_name(row["target_name"])
 
 
 def get_driver_polygon():
-    driver = pm.ls("*|Planes|Driver", type="transform")
+    """获取驱动多边形"""
+    driver = cmds.ls("*|Planes|Driver", type="transform") or []
     if len(driver) != 1:
-        return pm.warning("can not find driver")
+        cmds.warning("can not find driver")
+        return None
     return driver[0]
 
 
-def get_bs_data():
-    polygon = get_driver_polygon()
-    _bs = bs.get_bs(polygon)
-    target_names = []
-    for target_name in _bs.weight.elements():
-        attr = _bs.attr(target_name)
-        if not attr.inputs():
-            continue
-        input_node = attr.inputs()[0]
-        if input_node.name() != "CtrlAttrBsSdkBridge":
-            continue
-        target_names.append(target_name)
-    data = bs.get_blend_shape_data(polygon, target_names)
-    return data
-
-
-def load_bs_data(data):
-    driver = pm.ls("*|Planes|Driver", type="transform")
-    if len(driver) != 1:
-        return pm.warning("can not find driver")
-    polygon = driver[0]
-    bs.set_blend_shape_data(polygon, data)
-
-
-def save_json():
-    path = "D:/work/facs/sdk.json"
-    data = dict(
-        sdk=get_sdk_data(),
-        bs=get_bs_data(),
-    )
-    with open(path, "w") as fp:
-        json.dump(data, fp)
-
-
-def load_json():
-    path = "D:/work/facs/sdk.json"
-    with open(path, "r") as fp:
-        data = json.load(fp)
-    set_sdk_data(data["sdk"])
-    bridge = get_bridge()
-    polygon = get_driver_polygon()
-    for row in data["bs"]:
-        bs.bridge_connect(bridge.attr(row["target_name"]), polygon)
-    load_bs_data(data["bs"])
-
-
-def warp_copy(targets=None, static=True):
+def warp_copy(targets=None):
+    """包裹复制"""
+    all_to_zero()
     polygons = get_selected_polygons()
     if not len(polygons) == 2:
-        return pm.warning("please selected two polygon")
+        cmds.warning("please selected two polygon")
+        return
     if not targets:
         targets = get_targets()
     src, dst = polygons
-    set_pose_by_targets([])
-    pm.refresh()
-    warp = dst.duplicate()[0]
-    bs.get_orig(warp)
-    pm.select(warp, src)
-    pm.mel.CreateWrap()
+    cmds.refresh()
+    warp = cmds.duplicate(dst)[0]
+    cmds.select(warp, src)
+    from maya import mel
+    mel.eval('CreateWrap')
     for target in targets:
-        set_pose_by_targets([target])
-        pm.select(warp, dst)
-        if static:
-            edit_static_target(target)
-        else:
-            edit_target(target)
-        pm.refresh()
-    set_pose_by_targets([])
-    pm.delete(warp)
+        to_targets([target], 60)
+        cmds.select(warp, dst)
+        edit_target(target)
+        to_targets([target], 0)
+    cmds.delete(warp)
+
+
+
+def is_base_target(data):
+    if len(data) != 1:
+        return False
+    target_name = data[0]["target_name"]
+    if not exists_target(target_name):
+        return True
+    if get_ib_target(target_name):
+        return False
+    else:
+        return True
+
+def is_ib_target(data):
+    if len(data) != 1:
+        return False
+    target_name = data[0]["target_name"]
+    if not exists_target(target_name):
+        return False
+    if get_ib_target(target_name):
+        return True
+    else:
+        return False
+
+def is_comb_target(data):
+    if len(data) < 2:
+        return False
+    bridge = get_bridge()
+    attrs = [bridge+"."+row["target_name"] for row in data]
+    for attr in attrs:
+        if not cmds.objExists(attr):
+            return False
+        value = cmds.getAttr(attr)
+        if abs(value - 1) > 0.001:
+            return False
+    return True
+
+
+def is_comb_ib(data):
+    if len(data) < 2:
+        return False
+    bridge = get_bridge()
+    target_names = [row["target_name"] for row in data]
+    comb_name = "_COMB_".join(list(sorted(target_names)))
+    attr = bridge + "." + comb_name
+    if not cmds.objExists(attr):
+        return False
+    attrs = [bridge+"."+row["target_name"] for row in data]
+    values = []
+    for attr in attrs:
+        if not cmds.objExists(attr):
+            return False
+        values.append(cmds.getAttr(attr))
+    ibs = [int(round(value * 60)) for value in values]
+    for ib in ibs:
+        if ib != ibs[0]:
+            return False
+    if ibs[0] == 0 or ibs[0] == 60:
+        return False
+    return True
+
+
+def get_auto_target_name_by_data(data):
+    if is_base_target(data):
+        return data[0]["target_name"], "base"
+    elif is_ib_target(data):
+        return get_ib_target(data[0]["target_name"]), "ib"
+    elif is_comb_target(data):
+        target_names = [row["target_name"] for row in data]
+        comb_name = "_COMB_".join(list(sorted(target_names)))
+        return comb_name, "comb"
+    elif is_comb_ib(data):
+        target_names = [row["target_name"] for row in data]
+        comb_name = "_COMB_".join(list(sorted(target_names)))
+        comb_ib_target = get_ib_target(comb_name)
+        return comb_ib_target, "ib"
+    return "", ""
+
+
+def auto_add_target(data, target_name, target_type):
+    if target_type == "base":
+        add_sdk(**data[0])
+    elif target_type == "comb":
+        add_comb([row["target_name"] for row in data])
+    elif target_type == "ib":
+        add_ib_by_ib_name(target_name)
+
+def get_real_ctrls(query):
+    ctrls, _ = get_use_ctrls_datas()
+    ctrls = cmds.ls(query + ctrls)
+    ctrls = list(set(ctrls))
+    return ctrls
+
+def auto_add_edit_target(query):
+    polygons = bs.get_selected_polygons()
+    ctrls = get_real_ctrls(query)
+    data = find_add_sdk_data(ctrls)
+
+    target_name, target_type = get_auto_target_name_by_data(data)
+    if not target_name:
+        return
+    auto_add_target(data, target_name, target_type)
+    if len(polygons) != 2:
+        return
+    cmds.select(polygons)
+    edit_target(target_name)
+
+
+def auto_apply(query):
+    """自动应用"""
+    selected = cmds.ls(sl=1)
+    ctrls = get_real_ctrls(query)
+    data = find_add_sdk_data(ctrls)
+    target_name, target_type = get_auto_target_name_by_data(data)
+
+    if not target_name:
+        return
+
+    def _add_target(_target_name):
+        bridge = get_bridge()
+        auto_add_target(data, target_name, target_type)
+        return bridge + "." + _target_name
+
+    def _set_target(_target_name):
+        if not target_is_base(_target_name):
+            to_targets([_target_name])
+
+    cmds.select(cmds.ls(selected))
+    bs.auto_duplicate_edit([target_name], _add_target, _set_target)
+
+
+import re
+
+def target_is_ib(target):
+    return bool(re.search(r"_IB\d+$", target))
+
+def target_is_comb(target):
+    return "_COMB_" in target
+
+def target_is_base(target):
+    return not target_is_ib(target) and not target_is_comb(target)
+
+
+def get_use_ctrls_datas():
+    bridge = get_bridge()
+    ctrls = []
+    datas = []
+    for target in get_targets():
+        attr = bridge + "." + target
+        if abs(cmds.getAttr(attr))<0.0001:
+            continue
+        if not target_is_base(target):
+            continue
+        data = get_base_sdk_data(bridge, target)
+        datas.append(data)
+        ctrl = data[0]
+        if ctrl not in ctrls:
+            ctrls.append(ctrl)
+    return ctrls, datas
+
+
+def all_to_zero():
+    ctrls, datas = get_use_ctrls_datas()
+    identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    for ctrl in ctrls:
+        cmds.xform(ctrl, m=identity, ws=False)
+    for data in datas:
+        ctrl, attr, default_value, value = data
+        cmds.setAttr(attr, default_value)
+
+
+def esc():
+    if bs.is_on_duplicate_edit():
+        bs.finish_duplicate_edit(lambda x:x)
+    all_to_zero()
